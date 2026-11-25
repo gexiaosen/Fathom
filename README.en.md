@@ -4,9 +4,16 @@ Fathom is a native macOS floor-plan and interior-design tool for designers, reno
 
 Local-first: no account, no cloud dependency. Plans and preferences stay on your Mac.
 
-**0.0.1** · macOS 11+ · Apple Silicon / Intel
+**0.0.2** · macOS 11+ · Apple Silicon / Intel
 
 [Download](https://github.com/gexiaosen/Fathom/releases) · [Changelog](CHANGELOG.md)
+
+## What's new in 0.0.2
+
+- **Added:** Check for Updates in the More menu, a silent daily check, and a red-dot badge on the More button.
+- **Added:** Automatic download of the DMG for the current architecture, with signature, bundle ID, version and team validation.
+- **Added:** Restart & Update after download; Fathom replaces its own app bundle and relaunches.
+- **Improved:** Release notes render as plain text, with readable errors and retry actions in the dialog.
 
 ## What 0.0.1 does
 
@@ -55,7 +62,7 @@ Local-first: no account, no cloud dependency. Plans and preferences stay on your
 
 ## Install
 
-1. On Apple Silicon download `Fathom-v0.0.1-arm64.dmg`; on Intel download `Fathom-v0.0.1-x86_64.dmg`.
+1. On Apple Silicon download `Fathom-v0.0.2-arm64.dmg`; on Intel download `Fathom-v0.0.2-x86_64.dmg`.
 2. Open the DMG and drag `Fathom.app` into Applications.
 3. The build is not notarized. If Gatekeeper blocks the first launch, right-click the app and choose Open.
 
@@ -84,5 +91,5 @@ Source layout, build and macOS packaging live in [app/README.md](app/README.md).
 
 GNU General Public License v3.0, SPDX identifier `GPL-3.0-only`. See [LICENSE](LICENSE) for the full terms and [NOTICE](NOTICE) for the copyright notice.
 
-Copyright (C) 2026 Fathom Contributors
+Copyright (C) 2026 gexiaosen
 

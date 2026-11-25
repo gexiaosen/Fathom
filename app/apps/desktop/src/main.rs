@@ -15,6 +15,7 @@ mod templates;
 mod text_input;
 mod underlay;
 mod underlay_gpu;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -57,6 +58,23 @@ struct Vertex {
 #[derive(Clone)]
 struct FurnitureDrag {
     index: usize,
+}
+
+#[derive(Clone, Debug)]
+enum UpdatePhase {
+    Checking,
+    Latest(String),
+    Available(update::Release),
+    Downloading(update::Release),
+    Ready(update::PreparedUpdate),
+    Installing,
+    Failed(String),
+}
+
+impl Default for UpdatePhase {
+    fn default() -> Self {
+        Self::Checking
+    }
 }
 
 struct FurnitureDragPreview;
@@ -138,6 +156,11 @@ struct PlanEditor {
     new_menu_open: bool,
     recent_plans: Vec<recent::RecentPlan>,
     window_title: String,
+    update_open: bool,
+    update_phase: UpdatePhase,
+    /// Version offered by the quiet daily check; drives the dot on the More
+    /// button and the version hint inside its menu.
+    update_available: Option<String>,
 }
 
 impl PlanEditor {
@@ -146,7 +169,7 @@ impl PlanEditor {
     /// they reach the plan so a button click never also selects or places.
     fn pointer_over_chrome(&self, pos: [f32; 2], view: ViewMode) -> bool {
         let [w, h] = self.viewport;
-        if self.help_open {
+        if self.help_open || self.update_open {
             return true;
         }
         if pos[1] < 48.0 {
@@ -216,6 +239,7 @@ impl PlanEditor {
             || self.project_open
             || self.import_open
             || self.help_open
+            || self.update_open
             || self.inspector_edit.is_some()
         {
             return;
@@ -247,6 +271,7 @@ impl PlanEditor {
             || self.project_open
             || self.import_open
             || self.help_open
+            || self.update_open
             || self.inspector_edit.is_some()
         {
             return;
@@ -274,6 +299,7 @@ impl PlanEditor {
             || self.project_open
             || self.import_open
             || self.help_open
+            || self.update_open
             || self.inspector_edit.is_some()
         {
             return;
@@ -299,6 +325,9 @@ impl PlanEditor {
     }
 
     fn wheel(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        if self.update_open {
+            return;
+        }
         if self.new_menu_open
             || self.project_open
             || self.import_open
@@ -337,6 +366,14 @@ impl PlanEditor {
         let shift = ev.keystroke.modifiers.shift;
         let alt = ev.keystroke.modifiers.alt;
         let key = ev.keystroke.key.clone();
+        if self.update_open {
+            if key == "escape" {
+                self.update_open = false;
+                self.more_open = false;
+                cx.notify();
+            }
+            return;
+        }
         if self.help_open {
             if key == "escape" {
                 self.help_open = false;
@@ -659,6 +696,112 @@ impl PlanEditor {
         cx.notify();
     }
 
+    /// Manual path from the More menu: always opens the panel and re-checks.
+    fn open_update(&mut self, cx: &mut Context<Self>) {
+        self.more_open = false;
+        self.export_open = false;
+        self.update_open = true;
+        self.start_update_check(false, cx);
+    }
+
+    /// Quiet launch check, throttled to once every 24 h. It only sets the dot
+    /// on the More button; no window or toast interrupts the user.
+    fn maybe_check_updates(&mut self, cx: &mut Context<Self>) {
+        if update::should_check_daily() {
+            self.start_update_check(true, cx);
+        }
+    }
+
+    fn start_update_check(&mut self, silent: bool, cx: &mut Context<Self>) {
+        update::mark_check_now();
+        if !silent {
+            self.update_phase = UpdatePhase::Checking;
+            self.update_open = true;
+            cx.notify();
+        }
+
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { update::check_latest() })
+                .await;
+
+            let Some(entity) = weak.upgrade() else {
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| {
+                match result {
+                    Ok(Some(release)) => {
+                        this.update_available = Some(release.version.clone());
+                        if this.update_open {
+                            this.update_phase = UpdatePhase::Available(release);
+                        }
+                    }
+                    Ok(None) => {
+                        this.update_available = None;
+                        if this.update_open {
+                            this.update_phase =
+                                UpdatePhase::Latest(update::current_version().to_owned());
+                        }
+                    }
+                    Err(err) => {
+                        if this.update_open {
+                            this.update_phase = UpdatePhase::Failed(err);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_update_download(&mut self, release: update::Release, cx: &mut Context<Self>) {
+        self.update_phase = UpdatePhase::Downloading(release.clone());
+        cx.notify();
+
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { update::download_and_stage(&release) })
+                .await;
+
+            let Some(entity) = weak.upgrade() else {
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| {
+                if let Ok(prepared) = &result {
+                    #[cfg(debug_assertions)]
+                    if std::env::var("FP_UPDATE_AUTO_INSTALL").is_ok() {
+                        this.install_update(prepared.clone(), cx);
+                        return;
+                    }
+                }
+                this.update_phase = match result {
+                    Ok(prepared) => UpdatePhase::Ready(prepared),
+                    Err(err) => UpdatePhase::Failed(err),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn install_update(&mut self, prepared: update::PreparedUpdate, cx: &mut Context<Self>) {
+        self.update_phase = UpdatePhase::Installing;
+        cx.notify();
+
+        match update::install_and_relaunch(&prepared.staged_app, &prepared.destination) {
+            Ok(()) => cx.quit(),
+            Err(err) => {
+                self.update_phase = UpdatePhase::Failed(err);
+                cx.notify();
+            }
+        }
+    }
+
     fn create_new(&mut self, kind: templates::TemplateKind, cx: &mut Context<Self>) {
         let lang = self.state.lock().unwrap().lang;
         let doc = templates::build(kind, lang);
@@ -875,6 +1018,9 @@ impl Render for PlanEditor {
         let scale_open = self.scale_open;
         let wall_kind_open = self.wall_kind_open;
         let help_open = self.help_open;
+        let update_open = self.update_open;
+        let update_phase = self.update_phase.clone();
+        let update_available = self.update_available.clone();
         self.inspector_shown = right_open && inspector.is_some();
 
         let rooms3d = if view == ViewMode::Three {
@@ -1058,7 +1204,13 @@ impl Render for PlanEditor {
                     )
                     .child(save_chrome_button(dirty, cx))
                     .child(chrome_button(ICON_EXPORT, export_open, cx, chrome_export))
-                    .child(chrome_button(ICON_MORE, more_open, cx, chrome_more))
+                    .child(chrome_button_with_badge(
+                        ICON_MORE,
+                        more_open,
+                        update_available.is_some(),
+                        cx,
+                        chrome_more,
+                    ))
                     .child(chrome_button(
                         if night { ICON_MOON } else { ICON_SUN },
                         night,
@@ -1628,7 +1780,15 @@ impl Render for PlanEditor {
                                                 }
                                             },
                                         ),
-                                ),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(1.0))
+                                        .mx(px(6.0))
+                                        .my(px(4.0))
+                                        .bg(rgba(CHROME_BORDER)),
+                                )
+                                .child(update_button(t, update_available.clone(), cx)),
                         )
                         .with_animation(
                             "more-menu-in",
@@ -1678,6 +1838,9 @@ impl Render for PlanEditor {
                 ))
             })
             .when(help_open, |el| el.child(help_modal(lang, cx)))
+            .when(update_open, |el| {
+                el.child(update_modal(update_phase, lang, cx.entity().downgrade()))
+            })
             // ------------------------------------------------------------------
             .on_mouse_down(
                 MouseButton::Left,
@@ -1763,6 +1926,8 @@ const ICON_REDO: &str = r#"<path d='M15 7l5 5-5 5'/><path d='M20 12h-9a4 4 0 0 0
 const ICON_SAVE: &str = r#"<path d='M5 4h12l2 2v14H5V4z'/><path d='M8 4v6h8V4M8 20v-6h8v6'/>"#;
 const ICON_EXPORT: &str = r#"<path d='M12 15V4M8 8l4-4 4 4'/><path d='M5 14v5h14v-5'/>"#;
 const ICON_MORE: &str = r#"<circle cx='5' cy='12' r='1.4' stroke-width='2.8'/><circle cx='12' cy='12' r='1.4' stroke-width='2.8'/><circle cx='19' cy='12' r='1.4' stroke-width='2.8'/>"#;
+const ICON_REFRESH: &str =
+    r#"<path d='M20 11a8 8 0 0 0-14.5-4.5M4 4v4h4M4 13a8 8 0 0 0 14.5 4.5M20 20v-4h-4'/>"#;
 const ICON_SUN: &str = r#"<circle cx='12' cy='12' r='4'/><path d='M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19'/>"#;
 const ICON_MOON: &str = r#"<path d='M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z'/>"#;
 const ICON_SCALE: &str = r#"<path d='M5 19L19 5M9 5H5v4M15 19h4v-4'/>"#;
@@ -2034,9 +2199,20 @@ fn chrome_button(
     cx: &mut Context<PlanEditor>,
     action: fn(&mut PlanEditor, &mut Window, &mut Context<PlanEditor>),
 ) -> impl IntoElement {
+    chrome_button_with_badge(icon, active, false, cx, action)
+}
+
+fn chrome_button_with_badge(
+    icon: &'static str,
+    active: bool,
+    badge: bool,
+    cx: &mut Context<PlanEditor>,
+    action: fn(&mut PlanEditor, &mut Window, &mut Context<PlanEditor>),
+) -> impl IntoElement {
     let state = cx.entity().downgrade();
     let fg = if active { ACCENT } else { PANEL_TEXT };
     div()
+        .relative()
         .w(px(30.0))
         .h(px(30.0))
         .rounded(px(8.0))
@@ -2063,6 +2239,20 @@ fn chrome_button(
             }
         })
         .child(ui_icon(icon, 17.0, fg))
+        .when(badge, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .top(px(3.0))
+                    .right(px(3.0))
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(0xe0524b))
+                    .border_1()
+                    .border_color(rgba(0xffffffcc)),
+            )
+        })
         .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
             if let Some(entity) = state.upgrade() {
                 entity.update(cx, |this, cx| action(this, window, cx));
@@ -2467,6 +2657,448 @@ fn help_modal(lang: i18n::Lang, cx: &mut Context<PlanEditor>) -> impl IntoElemen
                         )),
                 ),
         )
+}
+
+fn update_modal(
+    phase: UpdatePhase,
+    lang: i18n::Lang,
+    weak: WeakEntity<PlanEditor>,
+) -> impl IntoElement {
+    let t = i18n::T(lang);
+    let close_weak = weak.clone();
+    let footer_weak = weak.clone();
+    let current = update::current_version().to_owned();
+
+    let body: AnyElement = match phase {
+        UpdatePhase::Checking => div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .py(px(8.0))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(PANEL_TEXT))
+                    .child(t.s("正在检查更新…", "Checking for updates…")),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(t.s(
+                        "正在连接 GitHub Releases，请稍候。",
+                        "Contacting GitHub Releases, one moment.",
+                    )),
+            )
+            .into_any_element(),
+        UpdatePhase::Latest(version) => div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .py(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(9.0))
+                    .child(
+                        div()
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(13.0))
+                            .bg(rgba(0x2f8f5b18))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(ui_icon(ICON_CHECK, 14.0, 0x2f8f5b)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(PANEL_TEXT))
+                            .child(t.s("已是最新版本", "You're up to date")),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(SharedString::from(format!(
+                        "{} {}",
+                        t.s("当前版本", "Current version"),
+                        version
+                    ))),
+            )
+            .into_any_element(),
+        UpdatePhase::Available(release) => {
+            let page_url = release.page_url.clone();
+            let release_title = release.title.clone();
+            let has_dmg = !release.asset_name.is_empty();
+            let install_release = release.clone();
+            let close_after = close_weak.clone();
+            let download_weak = weak.clone();
+            let page_fallback = release.page_url.clone();
+            let notes = if release.notes.is_empty() {
+                t.f("暂无更新说明。", "No release notes.")
+            } else {
+                release.notes.clone()
+            };
+            let note_rows: Vec<AnyElement> = notes
+                .lines()
+                .take(11)
+                .map(|line| {
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(line.to_owned()))
+                        .into_any_element()
+                })
+                .collect();
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(release_title)),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(format!(
+                            "{} · {} {}",
+                            t.s("发现新版本", "New version"),
+                            t.s("当前", "Current"),
+                            current
+                        ))),
+                )
+                .child(
+                    div()
+                        .max_h(px(170.0))
+                        .overflow_hidden()
+                        .rounded_md()
+                        .bg(rgba(0x23283308))
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(note_rows),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgba(0x2328330d))
+                                .text_xs()
+                                .child(t.s("稍后", "Later"))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = close_after.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.update_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgba(0x2328330d))
+                                .text_xs()
+                                .child(t.s("查看 Release", "View release"))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                    open_external(&page_url);
+                                }),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2f6fed))
+                                .text_xs()
+                                .text_color(rgb(0xffffff))
+                                .child(if has_dmg {
+                                    t.s("下载更新", "Download update")
+                                } else {
+                                    t.s("打开下载页", "Open download page")
+                                })
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if !has_dmg {
+                                        open_external(&page_fallback);
+                                        return;
+                                    }
+                                    if let Some(entity) = download_weak.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.start_update_download(install_release.clone(), cx);
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                .into_any_element()
+        }
+        UpdatePhase::Downloading(release) => {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .py(px(8.0))
+                .child(div().text_size(px(13.0)).text_color(rgb(PANEL_TEXT)).child(
+                    SharedString::from(format!(
+                        "{} v{}…",
+                        t.s("正在下载", "Downloading"),
+                        release.version
+                    )),
+                ))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(t.s(
+                            "正在下载并校验安装包，请保持 Fathom 运行。",
+                            "Downloading and verifying the package; keep Fathom open.",
+                        )),
+                )
+                .into_any_element()
+        }
+        UpdatePhase::Ready(prepared) => {
+            let close_after = close_weak.clone();
+            let install_weak = weak.clone();
+            let install_prepared = prepared.clone();
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(9.0))
+                        .child(
+                            div()
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .rounded(px(13.0))
+                                .bg(rgba(0x2f8f5b18))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(ui_icon(ICON_CHECK, 14.0, 0x2f8f5b)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(rgb(PANEL_TEXT))
+                                .child(t.s("下载完成，可以安装", "Download complete")),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(format!(
+                            "{} v{} · {}",
+                            t.s("新版本", "New version"),
+                            prepared.release.version,
+                            t.s(
+                                "重启后自动替换当前 App",
+                                "Fathom will restart into the new app"
+                            )
+                        ))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgba(0x2328330d))
+                                .text_xs()
+                                .child(t.s("稍后", "Later"))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = close_after.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.update_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2f6fed))
+                                .text_xs()
+                                .text_color(rgb(0xffffff))
+                                .child(t.s("重启并更新", "Restart & Update"))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = install_weak.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.install_update(install_prepared.clone(), cx);
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                .into_any_element()
+        }
+        UpdatePhase::Installing => div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .py(px(8.0))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(PANEL_TEXT))
+                    .child(t.s("正在重启并安装…", "Restarting and installing…")),
+            )
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(t.s(
+                        "Fathom 会退出，替换完成后自动重新打开。",
+                        "Fathom will quit, replace the app, and reopen automatically.",
+                    )),
+            )
+            .into_any_element(),
+        UpdatePhase::Failed(message) => {
+            let retry_weak = footer_weak.clone();
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .py(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(rgb(DANGER))
+                        .child(t.s("更新失败", "Update failed")),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(message)),
+                )
+                .child(
+                    div().flex().justify_end().child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(0x2f6fed))
+                            .text_xs()
+                            .text_color(rgb(0xffffff))
+                            .child(t.s("重试", "Retry"))
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                if let Some(entity) = retry_weak.upgrade() {
+                                    entity.update(cx, |this, cx| {
+                                        this.more_open = false;
+                                        this.update_open = true;
+                                        this.start_update_check(false, cx);
+                                    });
+                                }
+                            }),
+                    ),
+                )
+                .into_any_element()
+        }
+    };
+
+    div()
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x0b0d12b8))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {})
+        .child(
+            div()
+                .w(px(500.0))
+                .rounded_lg()
+                .bg(rgba(0xf7f8fbfa))
+                .border_1()
+                .border_color(rgba(CHROME_BORDER))
+                .shadow_lg()
+                .p(px(18.0))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(logo_badge(24.0))
+                                .child(
+                                    div()
+                                        .text_size(px(15.0))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("检查更新", "Check for updates")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(22.0))
+                                .h(px(22.0))
+                                .rounded_md()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(12.0))
+                                .text_color(rgb(PANEL_MUTED))
+                                .child(ui_icon(ICON_CLOSE, 12.0, PANEL_MUTED))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = close_weak.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.update_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                .child(body)
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(t.s(
+                            "更新会校验新版签名，替换当前 Fathom.app 后自动重启。",
+                            "The update is signature-checked, then replaces the current Fathom.app and relaunches it.",
+                        )),
+                ),
+        )
+}
+
+fn open_external(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
 }
 
 fn scale_row(
@@ -3515,6 +4147,57 @@ fn new_button(label: &'static str, cx: &mut Context<PlanEditor>) -> impl IntoEle
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
             if let Some(entity) = state.upgrade() {
                 entity.update(cx, |this, cx| this.open_new_menu(cx));
+            }
+        })
+}
+
+fn update_button(
+    t: i18n::T,
+    available: Option<String>,
+    cx: &mut Context<PlanEditor>,
+) -> impl IntoElement {
+    let state = cx.entity().downgrade();
+    let has_update = available.is_some();
+    let hint = available.map(|version| format!("v{version}"));
+    div()
+        .w_full()
+        .h(px(33.0))
+        .px(px(11.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(9.0))
+        .text_size(px(10.5))
+        .text_color(rgb(PANEL_TEXT))
+        .hover(|style| style.bg(rgba(0x2328331c)))
+        .child(ui_icon(
+            ICON_REFRESH,
+            14.0,
+            if has_update { ACCENT } else { PANEL_MUTED },
+        ))
+        .child(t.s("检查更新…", "Check for updates…"))
+        .when(hint.is_some(), |el| {
+            el.child(
+                div()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .text_size(px(8.5))
+                    .text_color(rgb(ACCENT))
+                    .child(
+                        div()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded(px(2.5))
+                            .bg(rgb(0xe0524b)),
+                    )
+                    .child(SharedString::from(hint.unwrap_or_default())),
+            )
+        })
+        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            if let Some(entity) = state.upgrade() {
+                entity.update(cx, |this, cx| this.open_update(cx));
             }
         })
 }
@@ -5656,6 +6339,9 @@ fn main() {
                         new_menu_open: first_run,
                         recent_plans: recent::load(),
                         window_title: "Fathom 方寸".into(),
+                        update_open: false,
+                        update_phase: UpdatePhase::Checking,
+                        update_available: None,
                     }
                 });
                 #[cfg(debug_assertions)]
@@ -5679,6 +6365,61 @@ fn main() {
                     if let Some(kind) = kind {
                         view.update(cx, |this, cx| this.create_new(kind, cx));
                     }
+                }
+                #[cfg(debug_assertions)]
+                if let Ok(mode) = std::env::var("FP_UPDATE_SMOKE") {
+                    view.update(cx, |this, cx| {
+                        if mode == "live" {
+                            this.start_update_check(false, cx);
+                            return;
+                        }
+                        if mode == "download" {
+                            let url = std::env::var("FP_UPDATE_TEST_DMG_URL").unwrap_or_default();
+                            if url.is_empty() {
+                                this.update_open = true;
+                                this.update_phase =
+                                    UpdatePhase::Failed("缺少 FP_UPDATE_TEST_DMG_URL".into());
+                                return;
+                            }
+                            let arch = if cfg!(target_arch = "aarch64") {
+                                "arm64"
+                            } else {
+                                "x86_64"
+                            };
+                            this.update_open = true;
+                            this.start_update_download(
+                                update::Release {
+                                    version: "0.0.1".into(),
+                                    title: "Fathom 0.0.1".into(),
+                                    notes: "测试自动下载".into(),
+                                    page_url: "https://github.com/gexiaosen/Fathom/releases".into(),
+                                    download_url: url,
+                                    asset_name: format!("Fathom-v0.0.1-{arch}.dmg"),
+                                },
+                                cx,
+                            );
+                            return;
+                        }
+                        this.update_open = true;
+                        this.update_phase = match mode.as_str() {
+                            "latest" => UpdatePhase::Latest(update::current_version().to_owned()),
+                            "available" => UpdatePhase::Available(update::Release {
+                                version: "0.0.2".into(),
+                                title: "Fathom 0.0.2".into(),
+                                notes: "新增\n检查更新\n下载最新 DMG\n\n优化\n更新说明使用原生弹窗"
+                                    .into(),
+                                page_url: "https://github.com/gexiaosen/Fathom/releases".into(),
+                                download_url: "https://github.com/gexiaosen/Fathom/releases".into(),
+                                asset_name: "Fathom-v0.0.2-arm64.dmg".into(),
+                            }),
+                            "failed" => UpdatePhase::Failed("GitHub API 返回 HTTP 403".into()),
+                            _ => UpdatePhase::Checking,
+                        };
+                        cx.notify();
+                    });
+                }
+                if std::env::var("FP_UPDATE_SMOKE").is_err() {
+                    view.update(cx, |this, cx| this.maybe_check_updates(cx));
                 }
                 view
             },

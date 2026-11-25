@@ -4,9 +4,16 @@ Fathom（方寸）是一款为室内设计、装修和全屋定制打造的 macO
 
 本地优先：不需要账号，不依赖云同步，方案和偏好保存在本机。
 
-**0.0.1** · macOS 11+ · Apple Silicon / Intel
+**0.0.2** · macOS 11+ · Apple Silicon / Intel
 
 [下载安装包](https://github.com/gexiaosen/Fathom/releases) · [完整版本记录](CHANGELOG.md)
+
+## 0.0.2 更新
+
+- **新增**：更多菜单「检查更新…」、启动每日静默检查、更多按钮红点提醒。
+- **新增**：自动下载对应架构 DMG，校验签名、Bundle ID、版本和签名团队。
+- **新增**：下载完成后「重启并更新」，自动替换当前 Fathom.app 并重新打开。
+- **优化**：更新说明改为纯文本展示，错误原因和重试入口直接显示在弹窗中。
 
 ## 0.0.1 功能
 
@@ -55,7 +62,7 @@ Fathom（方寸）是一款为室内设计、装修和全屋定制打造的 macO
 
 ## 安装
 
-1. Apple Silicon 下载 `Fathom-v0.0.1-arm64.dmg`，Intel Mac 下载 `Fathom-v0.0.1-x86_64.dmg`。
+1. Apple Silicon 下载 `Fathom-v0.0.2-arm64.dmg`，Intel Mac 下载 `Fathom-v0.0.2-x86_64.dmg`。
 2. 打开 DMG，把 `Fathom.app` 拖入「应用程序」。
 3. 当前版本未做 Apple 公证；首次启动如被系统拦截，右键选择「打开」。
 
@@ -84,5 +91,5 @@ Fathom（方寸）是一款为室内设计、装修和全屋定制打造的 macO
 
 GNU General Public License v3.0，SPDX 标识 `GPL-3.0-only`。完整条款见 [LICENSE](LICENSE)，版权声明见 [NOTICE](NOTICE)。
 
-Copyright (C) 2026 Fathom Contributors
+Copyright (C) 2026 gexiaosen
 

@@ -26,8 +26,8 @@ cargo test -p fp-ui
 
 ```bash
 ./scripts/package_macos.sh
-# → dist/Fathom-arm64.app   + dist/Fathom-v0.0.1-arm64.dmg
-# → dist/Fathom-x86_64.app  + dist/Fathom-v0.0.1-x86_64.dmg
+# → dist/Fathom-arm64.app   + dist/Fathom-v0.0.2-arm64.dmg
+# → dist/Fathom-x86_64.app  + dist/Fathom-v0.0.2-x86_64.dmg
 ```
 
 默认依次打 arm64 和 x86_64 两个包，最低系统均为 macOS 11.0。只打其中一个：

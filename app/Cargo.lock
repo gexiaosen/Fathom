@@ -1761,14 +1761,14 @@ dependencies = [
 
 [[package]]
 name = "fp-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "fp-desktop"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "ab_glyph",
  "bytemuck",
@@ -1787,6 +1787,7 @@ dependencies = [
  "png 0.17.16",
  "pollster 1.0.3",
  "raw-window-handle",
+ "reqwest",
  "rfd 0.15.4",
  "serde",
  "serde_json",
@@ -1797,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "fp-geom"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "earcutr",
  "fp-core",
@@ -1806,14 +1807,14 @@ dependencies = [
 
 [[package]]
 name = "fp-history"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "fp-model",
 ]
 
 [[package]]
 name = "fp-model"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "fp-core",
  "fp-geom",
@@ -4712,6 +4713,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -4731,6 +4733,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

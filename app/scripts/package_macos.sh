@@ -6,8 +6,8 @@
 # Finder/AppleScript control is needed and it works headless.
 #
 # Architectures are packaged separately:
-#   dist/Fathom-v0.0.1-arm64.dmg
-#   dist/Fathom-v0.0.1-x86_64.dmg
+#   dist/Fathom-v0.0.2-arm64.dmg
+#   dist/Fathom-v0.0.2-x86_64.dmg
 #
 # Usage:
 #   ./scripts/package_macos.sh
@@ -19,8 +19,8 @@
 #   BIN              cargo binary (default: fp-desktop)
 #   APP_NAME         bundle name (default: Fathom)
 #   BUNDLE_ID        default: app.fathom.desktop
-#   VERSION          default: 0.0.1
-#   BUILD_NUMBER     default: 1
+#   VERSION          default: 0.0.2
+#   BUILD_NUMBER     default: 2
 #   MIN_MACOS        deployment target and LSMinimumSystemVersion (default: 11.0)
 #   CARGO            cargo executable; its sibling rustc is put first in PATH
 #   FATHOM_SIGN_IDENTITY  explicit signing identity; otherwise auto-detect
@@ -34,8 +34,8 @@ cd "$(dirname "$0")/.."
 BIN="${BIN:-fp-desktop}"
 APP_NAME="${APP_NAME:-Fathom}"
 BUNDLE_ID="${BUNDLE_ID:-app.fathom.desktop}"
-VERSION="${VERSION:-0.0.1}"
-BUILD_NUMBER="${BUILD_NUMBER:-1}"
+VERSION="${VERSION:-0.0.2}"
+BUILD_NUMBER="${BUILD_NUMBER:-2}"
 MIN_MACOS="${MIN_MACOS:-11.0}"
 MAKE_DMG="${MAKE_DMG:-1}"
 DIST="dist"
