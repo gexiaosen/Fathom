@@ -1,0 +1,1273 @@
+{
+  "schema_version": 1,
+  "meta": {
+    "name": "示例户型（Web 版导入）",
+    "client": "",
+    "address": "",
+    "note": "由 scripts/import_web_fixture.py 从 legacy/web/index.html 生成",
+    "created_at": "2026-11-20",
+    "updated_at": "2026-11-20"
+  },
+  "site": {
+    "boundary": [],
+    "floor": 1,
+    "unit": "Millimetre"
+  },
+  "walls": [
+    {
+      "id": 1,
+      "start": {
+        "x": 1580,
+        "y": -120
+      },
+      "end": {
+        "x": 2120,
+        "y": -120
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 2,
+      "start": {
+        "x": 1700,
+        "y": 0
+      },
+      "end": {
+        "x": 1700,
+        "y": 300
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 3,
+      "start": {
+        "x": 2120,
+        "y": -120
+      },
+      "end": {
+        "x": 4580,
+        "y": -120
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 4,
+      "start": {
+        "x": 4580,
+        "y": -120
+      },
+      "end": {
+        "x": 5140,
+        "y": -120
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 5,
+      "start": {
+        "x": 5760,
+        "y": -120
+      },
+      "end": {
+        "x": 6050,
+        "y": -120
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 6,
+      "start": {
+        "x": 6050,
+        "y": -120
+      },
+      "end": {
+        "x": 6600,
+        "y": -120
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 7,
+      "start": {
+        "x": 6480,
+        "y": 0
+      },
+      "end": {
+        "x": 6480,
+        "y": 300
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 8,
+      "start": {
+        "x": 6600,
+        "y": -120
+      },
+      "end": {
+        "x": 9960,
+        "y": -120
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 9,
+      "start": {
+        "x": 9960,
+        "y": -120
+      },
+      "end": {
+        "x": 10510,
+        "y": -120
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 10,
+      "start": {
+        "x": 10390,
+        "y": 0
+      },
+      "end": {
+        "x": 10390,
+        "y": 300
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 11,
+      "start": {
+        "x": 10390,
+        "y": 300
+      },
+      "end": {
+        "x": 10390,
+        "y": 800
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 12,
+      "start": {
+        "x": 10390,
+        "y": 2600
+      },
+      "end": {
+        "x": 10390,
+        "y": 3090
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 13,
+      "start": {
+        "x": 10390,
+        "y": 3090
+      },
+      "end": {
+        "x": 10390,
+        "y": 4260
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 14,
+      "start": {
+        "x": 10390,
+        "y": 5740
+      },
+      "end": {
+        "x": 10390,
+        "y": 6370
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 15,
+      "start": {
+        "x": 9960,
+        "y": 6490
+      },
+      "end": {
+        "x": 10510,
+        "y": 6490
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 16,
+      "start": {
+        "x": 10390,
+        "y": 6610
+      },
+      "end": {
+        "x": 10390,
+        "y": 7400
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 17,
+      "start": {
+        "x": 10390,
+        "y": 9770
+      },
+      "end": {
+        "x": 10390,
+        "y": 10560
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 18,
+      "start": {
+        "x": 9960,
+        "y": 10680
+      },
+      "end": {
+        "x": 10510,
+        "y": 10680
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 19,
+      "start": {
+        "x": 4580,
+        "y": 10680
+      },
+      "end": {
+        "x": 9960,
+        "y": 10680
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 20,
+      "start": {
+        "x": 10510,
+        "y": 10680
+      },
+      "end": {
+        "x": 12090,
+        "y": 10680
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 21,
+      "start": {
+        "x": 11970,
+        "y": 9960
+      },
+      "end": {
+        "x": 11970,
+        "y": 10560
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 22,
+      "start": {
+        "x": 4700,
+        "y": 9200
+      },
+      "end": {
+        "x": 4700,
+        "y": 10560
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 23,
+      "start": {
+        "x": 4700,
+        "y": 7960
+      },
+      "end": {
+        "x": 4700,
+        "y": 8310
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 24,
+      "start": {
+        "x": 3620,
+        "y": 8080
+      },
+      "end": {
+        "x": 4580,
+        "y": 8080
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 25,
+      "start": {
+        "x": 2180,
+        "y": 8080
+      },
+      "end": {
+        "x": 3620,
+        "y": 8080
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 26,
+      "start": {
+        "x": 2300,
+        "y": 7590
+      },
+      "end": {
+        "x": 2300,
+        "y": 7960
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 27,
+      "start": {
+        "x": 2180,
+        "y": 7495
+      },
+      "end": {
+        "x": 2420,
+        "y": 7495
+      },
+      "thickness_mm": 190,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 28,
+      "start": {
+        "x": -240,
+        "y": 8080
+      },
+      "end": {
+        "x": 2180,
+        "y": 8080
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 29,
+      "start": {
+        "x": -120,
+        "y": 3610
+      },
+      "end": {
+        "x": -120,
+        "y": 7960
+      },
+      "thickness_mm": 240,
+      "kind": "Exterior",
+      "height_mm": 2800
+    },
+    {
+      "id": 30,
+      "start": {
+        "x": 100,
+        "y": 4950
+      },
+      "end": {
+        "x": 100,
+        "y": 5190
+      },
+      "thickness_mm": 200,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 31,
+      "start": {
+        "x": 200,
+        "y": 5070
+      },
+      "end": {
+        "x": 1275,
+        "y": 5070
+      },
+      "thickness_mm": 240,
+      "kind": "Low",
+      "height_mm": 1000
+    },
+    {
+      "id": 32,
+      "start": {
+        "x": 1580,
+        "y": 3597
+      },
+      "end": {
+        "x": 2420,
+        "y": 3597
+      },
+      "thickness_mm": 455,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 33,
+      "start": {
+        "x": 2300,
+        "y": 4430
+      },
+      "end": {
+        "x": 2300,
+        "y": 5796
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 34,
+      "start": {
+        "x": 2135,
+        "y": 4950
+      },
+      "end": {
+        "x": 2135,
+        "y": 5190
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 35,
+      "start": {
+        "x": 2420,
+        "y": 5070
+      },
+      "end": {
+        "x": 4580,
+        "y": 5070
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 36,
+      "start": {
+        "x": 4700,
+        "y": 3280
+      },
+      "end": {
+        "x": 4700,
+        "y": 4075
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 37,
+      "start": {
+        "x": 4700,
+        "y": 4860
+      },
+      "end": {
+        "x": 4700,
+        "y": 5190
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 38,
+      "start": {
+        "x": 2420,
+        "y": 3490
+      },
+      "end": {
+        "x": 4580,
+        "y": 3490
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 39,
+      "start": {
+        "x": 4700,
+        "y": 0
+      },
+      "end": {
+        "x": 4700,
+        "y": 2400
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 40,
+      "start": {
+        "x": 4820,
+        "y": 2200
+      },
+      "end": {
+        "x": 6360,
+        "y": 2200
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 41,
+      "start": {
+        "x": 6480,
+        "y": 300
+      },
+      "end": {
+        "x": 6480,
+        "y": 1198
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 42,
+      "start": {
+        "x": 6480,
+        "y": 1983
+      },
+      "end": {
+        "x": 6480,
+        "y": 2400
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 43,
+      "start": {
+        "x": 6083,
+        "y": 3538
+      },
+      "end": {
+        "x": 6600,
+        "y": 3538
+      },
+      "thickness_mm": 337,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 44,
+      "start": {
+        "x": 6360,
+        "y": 3325
+      },
+      "end": {
+        "x": 6600,
+        "y": 3325
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 45,
+      "start": {
+        "x": 6600,
+        "y": 3490
+      },
+      "end": {
+        "x": 9960,
+        "y": 3490
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 46,
+      "start": {
+        "x": 9960,
+        "y": 3490
+      },
+      "end": {
+        "x": 10270,
+        "y": 3490
+      },
+      "thickness_mm": 240,
+      "kind": "Bearing",
+      "height_mm": 2800
+    },
+    {
+      "id": 47,
+      "start": {
+        "x": 6203,
+        "y": 4600
+      },
+      "end": {
+        "x": 6203,
+        "y": 6610
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    },
+    {
+      "id": 48,
+      "start": {
+        "x": 6323,
+        "y": 6490
+      },
+      "end": {
+        "x": 9960,
+        "y": 6490
+      },
+      "thickness_mm": 240,
+      "kind": "Partition",
+      "height_mm": 2800
+    }
+  ],
+  "openings": [
+    {
+      "id": 20000,
+      "wall_id": 19,
+      "kind": "Window",
+      "offset_mm": 1890,
+      "width_mm": 1600,
+      "height_mm": 1200,
+      "sill_mm": 900,
+      "swing_deg": 0.0
+    },
+    {
+      "id": 20001,
+      "wall_id": 29,
+      "kind": "Window",
+      "offset_mm": 1375,
+      "width_mm": 1600,
+      "height_mm": 1200,
+      "sill_mm": 900,
+      "swing_deg": 0.0
+    },
+    {
+      "id": 20002,
+      "wall_id": 8,
+      "kind": "Window",
+      "offset_mm": 880,
+      "width_mm": 1600,
+      "height_mm": 1200,
+      "sill_mm": 900,
+      "swing_deg": 0.0
+    },
+    {
+      "id": 20003,
+      "wall_id": 35,
+      "kind": "Door",
+      "offset_mm": 680,
+      "width_mm": 800,
+      "height_mm": 2050,
+      "sill_mm": 0,
+      "swing_deg": 90.0
+    },
+    {
+      "id": 20004,
+      "wall_id": 39,
+      "kind": "Door",
+      "offset_mm": 800,
+      "width_mm": 800,
+      "height_mm": 2050,
+      "sill_mm": 0,
+      "swing_deg": 90.0
+    },
+    {
+      "id": 20005,
+      "wall_id": 45,
+      "kind": "Door",
+      "offset_mm": 1280,
+      "width_mm": 800,
+      "height_mm": 2050,
+      "sill_mm": 0,
+      "swing_deg": 90.0
+    },
+    {
+      "id": 20006,
+      "wall_id": 48,
+      "kind": "Door",
+      "offset_mm": 1418,
+      "width_mm": 800,
+      "height_mm": 2050,
+      "sill_mm": 0,
+      "swing_deg": 90.0
+    }
+  ],
+  "rooms": [
+    {
+      "id": 1010,
+      "polygon": [
+        {
+          "x": 4820,
+          "y": 6610
+        },
+        {
+          "x": 10270,
+          "y": 6610
+        },
+        {
+          "x": 10270,
+          "y": 10560
+        },
+        {
+          "x": 4820,
+          "y": 10560
+        }
+      ],
+      "name": "客厅",
+      "material_id": 2003,
+      "counted": true,
+      "_web_id": "living"
+    },
+    {
+      "id": 1001,
+      "polygon": [
+        {
+          "x": 6600,
+          "y": 0
+        },
+        {
+          "x": 10270,
+          "y": 0
+        },
+        {
+          "x": 10270,
+          "y": 3370
+        },
+        {
+          "x": 6600,
+          "y": 3370
+        }
+      ],
+      "name": "主卧室",
+      "material_id": 2001,
+      "counted": true,
+      "_web_id": "master"
+    },
+    {
+      "id": 1006,
+      "polygon": [
+        {
+          "x": 6323,
+          "y": 3610
+        },
+        {
+          "x": 10270,
+          "y": 3610
+        },
+        {
+          "x": 10270,
+          "y": 6370
+        },
+        {
+          "x": 6323,
+          "y": 6370
+        }
+      ],
+      "name": "子女房",
+      "material_id": 2001,
+      "counted": true,
+      "_web_id": "child"
+    },
+    {
+      "id": 1003,
+      "polygon": [
+        {
+          "x": 1820,
+          "y": 0
+        },
+        {
+          "x": 4580,
+          "y": 0
+        },
+        {
+          "x": 4580,
+          "y": 3370
+        },
+        {
+          "x": 1820,
+          "y": 3370
+        }
+      ],
+      "name": "小孩房",
+      "material_id": 2001,
+      "counted": true,
+      "_web_id": "kid"
+    },
+    {
+      "id": 1008,
+      "polygon": [
+        {
+          "x": 2420,
+          "y": 5190
+        },
+        {
+          "x": 4820,
+          "y": 5190
+        },
+        {
+          "x": 4820,
+          "y": 7960
+        },
+        {
+          "x": 2420,
+          "y": 7960
+        },
+        {
+          "x": 2420,
+          "y": 7400
+        },
+        {
+          "x": 2180,
+          "y": 7400
+        },
+        {
+          "x": 2180,
+          "y": 5796
+        },
+        {
+          "x": 2420,
+          "y": 5796
+        }
+      ],
+      "name": "餐厅",
+      "material_id": 2003,
+      "counted": true,
+      "_web_id": "dining"
+    },
+    {
+      "id": 1007,
+      "polygon": [
+        {
+          "x": 0,
+          "y": 5190
+        },
+        {
+          "x": 2180,
+          "y": 5190
+        },
+        {
+          "x": 2180,
+          "y": 7960
+        },
+        {
+          "x": 0,
+          "y": 7960
+        }
+      ],
+      "name": "厨房",
+      "material_id": 2004,
+      "counted": true,
+      "_web_id": "kitchen"
+    },
+    {
+      "id": 1009,
+      "polygon": [
+        {
+          "x": 4820,
+          "y": 2320
+        },
+        {
+          "x": 6360,
+          "y": 2320
+        },
+        {
+          "x": 6360,
+          "y": 3370
+        },
+        {
+          "x": 6083,
+          "y": 3370
+        },
+        {
+          "x": 6083,
+          "y": 6610
+        },
+        {
+          "x": 4820,
+          "y": 6610
+        }
+      ],
+      "name": "过道",
+      "material_id": 2003,
+      "counted": true,
+      "_web_id": "hall"
+    },
+    {
+      "id": 1011,
+      "polygon": [
+        {
+          "x": 10510,
+          "y": 6610
+        },
+        {
+          "x": 11850,
+          "y": 6610
+        },
+        {
+          "x": 11850,
+          "y": 10560
+        },
+        {
+          "x": 10510,
+          "y": 10560
+        }
+      ],
+      "name": "休闲阳台",
+      "material_id": 2002,
+      "counted": true,
+      "_web_id": "balcony"
+    },
+    {
+      "id": 1002,
+      "polygon": [
+        {
+          "x": 4820,
+          "y": 0
+        },
+        {
+          "x": 6360,
+          "y": 0
+        },
+        {
+          "x": 6360,
+          "y": 2080
+        },
+        {
+          "x": 4820,
+          "y": 2080
+        }
+      ],
+      "name": "主卫浴",
+      "material_id": 2006,
+      "counted": true,
+      "_web_id": "mbath"
+    },
+    {
+      "id": 1005,
+      "polygon": [
+        {
+          "x": 0,
+          "y": 3610
+        },
+        {
+          "x": 2180,
+          "y": 3610
+        },
+        {
+          "x": 2180,
+          "y": 4950
+        },
+        {
+          "x": 0,
+          "y": 4950
+        }
+      ],
+      "name": "洗衣阳台",
+      "material_id": 2006,
+      "counted": true,
+      "_web_id": "laundry"
+    },
+    {
+      "id": 1004,
+      "polygon": [
+        {
+          "x": 2420,
+          "y": 3610
+        },
+        {
+          "x": 4580,
+          "y": 3610
+        },
+        {
+          "x": 4580,
+          "y": 4950
+        },
+        {
+          "x": 2420,
+          "y": 4950
+        }
+      ],
+      "name": "客卫浴",
+      "material_id": 2006,
+      "counted": true,
+      "_web_id": "gbath"
+    },
+    {
+      "id": 1012,
+      "polygon": [
+        {
+          "x": 10270,
+          "y": 800
+        },
+        {
+          "x": 10510,
+          "y": 800
+        },
+        {
+          "x": 10510,
+          "y": 760
+        },
+        {
+          "x": 11030,
+          "y": 760
+        },
+        {
+          "x": 11030,
+          "y": 2650
+        },
+        {
+          "x": 10510,
+          "y": 2650
+        },
+        {
+          "x": 10510,
+          "y": 2600
+        },
+        {
+          "x": 10270,
+          "y": 2600
+        }
+      ],
+      "name": "主卧飘窗",
+      "material_id": 2005,
+      "counted": false,
+      "_web_id": "bay1"
+    },
+    {
+      "id": 1013,
+      "polygon": [
+        {
+          "x": 10270,
+          "y": 4260
+        },
+        {
+          "x": 10510,
+          "y": 4260
+        },
+        {
+          "x": 10510,
+          "y": 4210
+        },
+        {
+          "x": 11030,
+          "y": 4210
+        },
+        {
+          "x": 11030,
+          "y": 5785
+        },
+        {
+          "x": 10510,
+          "y": 5785
+        },
+        {
+          "x": 10510,
+          "y": 5740
+        },
+        {
+          "x": 10270,
+          "y": 5740
+        }
+      ],
+      "name": "子女房飘窗",
+      "material_id": 2005,
+      "counted": false,
+      "_web_id": "bay2"
+    }
+  ],
+  "furniture": [
+    {
+      "id": 3001,
+      "asset_id": "sofa",
+      "name": "沙发",
+      "center": {
+        "x": 7545,
+        "y": 7985
+      },
+      "width_mm": 2200,
+      "depth_mm": 900,
+      "rotation_deg": 0.0,
+      "color": "#8b6f55",
+      "room_id": 1010
+    },
+    {
+      "id": 3002,
+      "asset_id": "tv",
+      "name": "电视柜",
+      "center": {
+        "x": 7545,
+        "y": 9485
+      },
+      "width_mm": 1800,
+      "depth_mm": 400,
+      "rotation_deg": 180.0,
+      "color": "#5f6673",
+      "room_id": 1010
+    },
+    {
+      "id": 3003,
+      "asset_id": "bed",
+      "name": "双人床",
+      "center": {
+        "x": 8435,
+        "y": 1685
+      },
+      "width_mm": 1800,
+      "depth_mm": 2000,
+      "rotation_deg": 0.0,
+      "color": "#a9b3c4",
+      "room_id": 1001
+    },
+    {
+      "id": 3004,
+      "asset_id": "cabinet",
+      "name": "衣柜",
+      "center": {
+        "x": 8435,
+        "y": 3485
+      },
+      "width_mm": 1200,
+      "depth_mm": 600,
+      "rotation_deg": 0.0,
+      "color": "#b7a58c",
+      "room_id": 1001
+    },
+    {
+      "id": 3005,
+      "asset_id": "table",
+      "name": "餐桌",
+      "center": {
+        "x": 8296,
+        "y": 4990
+      },
+      "width_mm": 1600,
+      "depth_mm": 900,
+      "rotation_deg": 0.0,
+      "color": "#a07a4f",
+      "room_id": 1006
+    }
+  ],
+  "materials": [
+    {
+      "id": 2001,
+      "name": "橡木地板",
+      "price_per_m2": 320.0,
+      "kind": "wood"
+    },
+    {
+      "id": 2002,
+      "name": "胡桃木地板",
+      "price_per_m2": 380.0,
+      "kind": "walnut"
+    },
+    {
+      "id": 2003,
+      "name": "800 地砖",
+      "price_per_m2": 220.0,
+      "kind": "tile800"
+    },
+    {
+      "id": 2004,
+      "name": "600 地砖",
+      "price_per_m2": 160.0,
+      "kind": "tile600"
+    },
+    {
+      "id": 2005,
+      "name": "大理石",
+      "price_per_m2": 650.0,
+      "kind": "marble"
+    },
+    {
+      "id": 2006,
+      "name": "300 防滑砖",
+      "price_per_m2": 140.0,
+      "kind": "antislip"
+    },
+    {
+      "id": 2007,
+      "name": "水磨石",
+      "price_per_m2": 280.0,
+      "kind": "terrazzo"
+    },
+    {
+      "id": 2008,
+      "name": "满铺地毯",
+      "price_per_m2": 200.0,
+      "kind": "carpet"
+    }
+  ],
+  "measures": [],
+  "settings": {
+    "grid_mm": 10,
+    "snap": true,
+    "show_dimensions": true
+  }
+}

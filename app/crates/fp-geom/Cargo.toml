@@ -1,0 +1,11 @@
+[package]
+name = "fp-geom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-core = { path = "../fp-core" }
+geo.workspace = true
+earcutr.workspace = true

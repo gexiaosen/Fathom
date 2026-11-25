@@ -1,0 +1,9 @@
+[package]
+name = "fp-history"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fp-model = { path = "../fp-model" }

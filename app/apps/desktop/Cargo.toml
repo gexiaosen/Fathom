@@ -1,0 +1,33 @@
+[package]
+name = "fp-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpui.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+wgpu = "30"
+half = "2"
+rfd = "0.15"
+png = "0.17"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+flate2 = "1"
+ab_glyph = "0.2.32"
+pollster = "1.0"
+unicode-segmentation = "1.13"
+serde.workspace = true
+serde_json.workspace = true
+fp-core = { path = "../../crates/fp-core" }
+fp-model = { path = "../../crates/fp-model" }
+fp-render2d = { path = "../../crates/fp-render2d" }
+fp-render3d = { path = "../../crates/fp-render3d" }
+fp-geom = { path = "../../crates/fp-geom" }
+fp-ui = { path = "../../crates/fp-ui" }
+fp-history = { path = "../../crates/fp-history" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+raw-window-handle = "0.6"

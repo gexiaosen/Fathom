@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop",
+    "crates/fp-core",
+    "crates/fp-model",
+    "crates/fp-geom",
+    "crates/fp-history",
+    "crates/fp-render2d",
+    "crates/fp-ui",
+    "crates/fp-render3d",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-only"
+authors = ["Floorplan-3D Contributors"]
+
+[workspace.dependencies]
+wgpui = "0.4.0"
+bytemuck = { version = "1.24", features = ["derive"] }
+glam = "0.30"
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+geo = "0.30"
+earcutr = "0.4"
+tracing-subscriber = "0.3"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
