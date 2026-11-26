@@ -1,0 +1,118 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v, e.g. 0.0.4"
+        required: true
+        default: "0.0.4"
+
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+          key: ${{ matrix.arch }}
+
+      - name: Import Apple signing certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then
+            echo "::error::缺少 APPLE_CERTIFICATE_P12；发布包必须使用与现有更新链路一致的 Apple Development 签名"
+            exit 1
+          fi
+          CERT="$RUNNER_TEMP/fathom-signing.p12"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT"
+          KEYCHAIN="$RUNNER_TEMP/fathom-signing.keychain-db"
+          KEYCHAIN_PASSWORD="fathom-ci"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          rm -f "$CERT"
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::缺少 APPLE_SIGNING_IDENTITY"
+            exit 1
+          fi
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Build ${{ matrix.arch }} DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        run: |
+          VERSION="${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}"
+          VERSION="${VERSION#v}"
+          FATHOM_SIGN_IDENTITY="$APPLE_SIGNING_IDENTITY" \
+          VERSION="$VERSION" \
+          BUILD_NUMBER="${{ github.run_number }}" \
+          ARCHES="${{ matrix.arch }}" \
+          MAKE_DMG=1 \
+          ./scripts/package_macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fathom-${{ matrix.arch }}
+          path: app/dist/Fathom-v*.dmg
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish DMGs to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          NOTES="RELEASE_NOTES_${VERSION}.md"
+          test -f "$NOTES"
+          shopt -s globstar nullglob
+          FILES=(dist/**/*.dmg)
+          test "${#FILES[@]}" -gt 0
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "Fathom ${VERSION}" \
+              --notes-file "$NOTES"
+          fi

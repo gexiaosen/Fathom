@@ -3528,9 +3528,11 @@ fn update_modal(
             } else {
                 release.notes.clone()
             };
+            // Release notes can be long. Keep every line and let the card
+            // scroll; truncating to the first screenful hid the rest of the
+            // changelog with no way to reach it.
             let note_rows: Vec<AnyElement> = notes
                 .lines()
-                .take(11)
                 .map(|line| {
                     div()
                         .text_size(px(10.0))
@@ -3562,8 +3564,9 @@ fn update_modal(
                 )
                 .child(
                     div()
-                        .max_h(px(170.0))
-                        .overflow_hidden()
+                        .id("update-notes-scroll")
+                        .max_h(px(250.0))
+                        .overflow_y_scroll()
                         .rounded_md()
                         .bg(rgba(0x23283308))
                         .p_2()
