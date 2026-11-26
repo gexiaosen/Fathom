@@ -12,12 +12,19 @@ use fp_core::{Mm, Pt};
 
 const EPS: f64 = 1e-6;
 
+/// Default join tolerance for room recovery. Walls drawn by hand can miss a
+/// corner by half a wall thickness; welding endpoints within this radius keeps
+/// a real room from disappearing because of a 50–150 mm drafting gap.
+pub const ROOM_JOIN_TOLERANCE_MM: Mm = 160;
+
 /// Detect rooms bounded by wall segments.
 ///
-/// - `tolerance_mm`: vertices closer than this are merged (default 10 mm).
+/// - `tolerance_mm`: endpoints within this distance are welded (default 160 mm
+///   via [`ROOM_JOIN_TOLERANCE_MM`]); vertices are then merged on that grid.
 /// - `min_area_m2`: faces smaller than this are discarded (default 0.3 m²).
 pub fn detect_rooms(segments: &[(Pt, Pt)], tolerance_mm: Mm, min_area_m2: f64) -> Vec<Vec<Pt>> {
-    let split = split_at_intersections(segments);
+    let welded = weld_segments(segments, tolerance_mm);
+    let split = split_at_intersections(&welded);
     if split.is_empty() {
         return Vec::new();
     }
@@ -148,8 +155,137 @@ pub fn detect_rooms(segments: &[(Pt, Pt)], tolerance_mm: Mm, min_area_m2: f64) -
     rooms
 }
 
-fn signed_area_f64(points: &[Pt]) -> f64 {
-    if points.len() < 3 {
+/// Weld near-coincident wall endpoints and endpoints that stop just short of
+/// another wall. Room detection works on centrelines, so a 100 mm drafting gap
+/// at a corner otherwise produces an open polyline and no room at all.
+fn weld_segments(segments: &[(Pt, Pt)], tolerance_mm: Mm) -> Vec<(Pt, Pt)> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let tolerance = tolerance_mm.max(1) as f64;
+    let count = segments.len() * 2;
+
+    // Endpoint-to-endpoint welds must choose one canonical point for the
+    // whole cluster. Snapping each endpoint to its nearest neighbour looks
+    // right for two points but makes a near-closed corner swap places.
+    let mut parent: Vec<usize> = (0..count).collect();
+    fn find(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    }
+
+    let endpoint = |index: usize| {
+        let segment = index / 2;
+        if index % 2 == 0 {
+            segments[segment].0
+        } else {
+            segments[segment].1
+        }
+    };
+    for i in 0..count {
+        for j in (i + 1)..count {
+            if point_distance(endpoint(i), endpoint(j)) <= tolerance {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+
+    let mut canonical: Vec<Option<Pt>> = vec![None; count];
+    for i in 0..count {
+        let root = find(&mut parent, i);
+        let point = endpoint(i);
+        canonical[root] = Some(match canonical[root] {
+            Some(current) if (current.x, current.y) < (point.x, point.y) => current,
+            _ => point,
+        });
+    }
+
+    let mut out = Vec::with_capacity(segments.len());
+    for (index, (a, b)) in segments.iter().enumerate() {
+        let a_root = find(&mut parent, index * 2);
+        let b_root = find(&mut parent, index * 2 + 1);
+        // A clustered endpoint takes the cluster's canonical point. Only a
+        // lone endpoint is projected onto a nearby wall for a T-junction.
+        let a2 = if cluster_len(&parent, a_root) > 1 {
+            canonical[a_root].unwrap_or(*a)
+        } else {
+            project_endpoint(*a, index, segments, tolerance)
+        };
+        let b2 = if cluster_len(&parent, b_root) > 1 {
+            canonical[b_root].unwrap_or(*b)
+        } else {
+            project_endpoint(*b, index, segments, tolerance)
+        };
+        if a2 != b2 {
+            out.push((a2, b2));
+        }
+    }
+    out
+}
+
+fn cluster_len(parent: &[usize], root: usize) -> usize {
+    (0..parent.len()).filter(|&i| find_root(parent, i) == root).count()
+}
+
+fn find_root(parent: &[usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        index = parent[index];
+    }
+    index
+}
+
+fn project_endpoint(
+    p: Pt,
+    own_segment: usize,
+    segments: &[(Pt, Pt)],
+    tolerance: f64,
+) -> Pt {
+    let mut best = p;
+    let mut best_distance = tolerance;
+    for (index, (a, b)) in segments.iter().enumerate() {
+        if index == own_segment {
+            continue;
+        }
+        let projected = project_to_segment(p, *a, *b);
+        let distance = point_distance(p, projected);
+        if distance < best_distance {
+            best = projected;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
+fn point_distance(a: Pt, b: Pt) -> f64 {
+    ((a.x - b.x) as f64).hypot((a.y - b.y) as f64)
+}
+
+fn project_to_segment(p: Pt, a: Pt, b: Pt) -> Pt {
+    let dx = (b.x - a.x) as f64;
+    let dy = (b.y - a.y) as f64;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < EPS {
+        return a;
+    }
+    let t = (((p.x - a.x) as f64) * dx + ((p.y - a.y) as f64) * dy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    Pt::new(
+        (a.x as f64 + dx * t).round() as Mm,
+        (a.y as f64 + dy * t).round() as Mm,
+    )
+}
+
+fn signed_area_f64(points: &[Pt]) -> f64 {    if points.len() < 3 {
         return 0.0;
     }
     let mut sum = 0.0;
@@ -308,5 +444,29 @@ mod tests {
             (Pt::new(4000, 3000), Pt::new(0, 3000)),
         ];
         assert!(detect_rooms(&segs, 10, 0.3).is_empty());
+    }
+
+    #[test]
+    fn a_small_corner_gap_is_welded_into_a_room() {
+        let mut segs = rect(0, 0, 4000, 3000);
+        // Pull one corner endpoint away from the other, leaving a 113 mm
+        // diagonal gap. Hand drawing produces this when the second wall starts
+        // just inside the first rather than exactly on its end.
+        segs[3].1 = Pt::new(80, 80);
+        let rooms = detect_rooms(&segs, ROOM_JOIN_TOLERANCE_MM, 0.3);
+        assert_eq!(rooms.len(), 1, "small drafting gap should not erase the room");
+    }
+
+    #[test]
+    fn a_t_junction_endpoint_is_projected_onto_the_wall() {
+        let mut segs = rect(0, 0, 6000, 4000);
+        // A partition stops 90 mm short of the bottom wall. Welding its end
+        // onto the wall centreline lets the planar graph split the room.
+        segs.push((Pt::new(3000, 3910), Pt::new(3000, 90)));
+        let rooms = detect_rooms(&segs, ROOM_JOIN_TOLERANCE_MM, 0.3);
+        assert_eq!(rooms.len(), 2, "T-junction should split into two rooms");
+        for room in &rooms {
+            assert!((signed_area_f64(room).abs() - 12_000_000.0).abs() < 1.0);
+        }
     }
 }

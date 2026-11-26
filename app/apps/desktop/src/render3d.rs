@@ -7,11 +7,13 @@ use bytemuck::{Pod, Zeroable};
 use fp_render3d::MeshVertex;
 
 use crate::envmap;
+use crate::surface_detail;
 use glam::Mat4;
 
 const MAX_VERTICES: usize = 600_000;
 const SHADOW_SIZE: u32 = 2048;
 const MSAA: u32 = 4;
+const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -24,6 +26,8 @@ struct Uniforms {
     lamps: [[f32; 4]; 8],
     light_vp: [[f32; 4]; 4],
     screen: [f32; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    ssao: [f32; 4],
 }
 
 /// Lighting preset for the 3D pass: sun direction, ambient/diffuse weights,
@@ -42,6 +46,10 @@ pub struct Look {
     pub light_vp: [[f32; 4]; 4],
     /// 0 = no shadow look-up, 1 = sample the sun shadow map.
     pub shadows: f32,
+    /// Linear exposure multiplier after the PBR lighting sum.
+    pub exposure: f32,
+    /// Screen-space AO strength (0 disables, 1 full).
+    pub ssao: f32,
 }
 
 /// Everything the 3D pass needs besides the mesh itself.
@@ -56,14 +64,16 @@ impl Look {
     pub fn day() -> Self {
         Self {
             light: [0.45, -1.0, 0.35],
-            ambient: 0.36,
-            diffuse: 0.64,
+            ambient: 0.50,
+            diffuse: 0.25,
             tint: [1.0, 1.0, 1.0],
             clear: [0.08, 0.09, 0.12],
             lamps: [[0.0; 4]; 8],
             lamp_count: 0.0,
             light_vp: Mat4::IDENTITY.to_cols_array_2d(),
             shadows: 0.0,
+            exposure: 0.76,
+            ssao: 0.55,
         }
     }
 }
@@ -92,9 +102,17 @@ pub struct Renderer3d {
     format: wgpu::TextureFormat,
     msaa_view: wgpu::TextureView,
     opaque_view: wgpu::TextureView,
+    normal_msaa_view: wgpu::TextureView,
+    normal_view: wgpu::TextureView,
+    scene_view: wgpu::TextureView,
     bgl: wgpu::BindGroupLayout,
     shadow_sampler: wgpu::Sampler,
     env: envmap::EnvMap,
+    surface_detail: surface_detail::SurfaceDetail,
+    post_pipeline: wgpu::RenderPipeline,
+    post_bgl: wgpu::BindGroupLayout,
+    post_bind_group: wgpu::BindGroup,
+    post_sampler: wgpu::Sampler,
 }
 
 impl Renderer3d {
@@ -164,6 +182,32 @@ impl Renderer3d {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         // Two shadow maps, ping-ponged: a frame writes one and samples the
@@ -204,6 +248,7 @@ impl Renderer3d {
             ..Default::default()
         });
         let env = envmap::create(device, queue);
+        let surface_detail = surface_detail::create(device, queue);
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene3d uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -211,6 +256,9 @@ impl Renderer3d {
             mapped_at_creation: false,
         });
         let opaque_view = create_opaque(device, format, (width, height));
+        let normal_msaa_view = create_normal_msaa(device, (width, height));
+        let normal_view = create_normal_resolve(device, (width, height));
+        let scene_view = create_scene(device, format, (width, height));
         let dummy_view = create_dummy(device);
         let opaque_bind_groups = make_main_bind_groups(
             device,
@@ -219,6 +267,9 @@ impl Renderer3d {
             &shadow_views,
             &shadow_sampler,
             &env,
+            &surface_detail.view,
+            &surface_detail.albedo_view,
+            &surface_detail.sampler,
             &dummy_view,
         );
         let main_bind_groups = make_main_bind_groups(
@@ -228,6 +279,9 @@ impl Renderer3d {
             &shadow_views,
             &shadow_sampler,
             &env,
+            &surface_detail.view,
+            &surface_detail.albedo_view,
+            &surface_detail.sampler,
             &opaque_view,
         );
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -282,6 +336,117 @@ impl Renderer3d {
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
+        // SSAO post-process: a full-screen pass reads the resolved scene and
+        // the multisampled depth (sample 0), then writes to the caller's
+        // target. This keeps the scene pipeline simple and makes the effect
+        // work identically for the window and for headless exports.
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene3d post shader"),
+            source: wgpu::ShaderSource::Wgsl(POST_SHADER.into()),
+        });
+        let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene3d post bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: true,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scene3d post sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene3d post layout"),
+            bind_group_layouts: &[Some(&post_bgl)],
+            immediate_size: 0,
+        });
+        let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scene3d post pipeline"),
+            layout: Some(&post_layout),
+            vertex: wgpu::VertexState {
+                module: &post_shader,
+                entry_point: Some("vs_post"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &post_shader,
+                entry_point: Some("fs_post"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let depth_size = (width, height);
+        let depth = create_depth(device, depth_size, MSAA);
+        let post_bind_group = make_post_bind_group(
+            device,
+            &post_bgl,
+            &uniform,
+            &scene_view,
+            &normal_view,
+            &depth,
+            &post_sampler,
+        );
         let pipeline = scene_pipeline(device, &layout, &shader, format, false);
         let glass_pipeline = scene_pipeline(device, &layout, &shader, format, true);
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -312,11 +477,18 @@ impl Renderer3d {
                 module: &shader,
                 entry_point: Some("fs_sky"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: NORMAL_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
             }),
             multiview_mask: None,
             cache: None,
@@ -375,8 +547,6 @@ impl Renderer3d {
             mapped_at_creation: false,
         });
 
-        let depth_size = (width, height);
-        let depth = create_depth(device, depth_size, MSAA);
         let msaa_view = create_msaa(device, format, depth_size);
 
         queue.write_buffer(
@@ -391,6 +561,8 @@ impl Renderer3d {
                 lamps: [[0.0; 4]; 8],
                 light_vp: Mat4::IDENTITY.to_cols_array_2d(),
                 screen: [width as f32, height as f32, 0.0, 0.0],
+                inv_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                ssao: [0.55, 0.32, 0.035, 0.0],
             }),
         );
 
@@ -418,9 +590,17 @@ impl Renderer3d {
             format,
             msaa_view,
             opaque_view,
+            normal_msaa_view,
+            normal_view,
+            scene_view,
             bgl,
             shadow_sampler,
             env,
+            surface_detail,
+            post_pipeline,
+            post_bgl,
+            post_bind_group,
+            post_sampler,
         }
     }
 
@@ -433,6 +613,9 @@ impl Renderer3d {
         self.depth = create_depth(device, size, MSAA);
         self.msaa_view = create_msaa(device, self.format, size);
         self.opaque_view = create_opaque(device, self.format, size);
+        self.normal_msaa_view = create_normal_msaa(device, size);
+        self.normal_view = create_normal_resolve(device, size);
+        self.scene_view = create_scene(device, self.format, size);
         self.main_bind_groups = make_main_bind_groups(
             device,
             &self.bgl,
@@ -440,7 +623,19 @@ impl Renderer3d {
             &self.shadow_views,
             &self.shadow_sampler,
             &self.env,
+            &self.surface_detail.view,
+            &self.surface_detail.albedo_view,
+            &self.surface_detail.sampler,
             &self.opaque_view,
+        );
+        self.post_bind_group = make_post_bind_group(
+            device,
+            &self.post_bgl,
+            &self.uniform,
+            &self.scene_view,
+            &self.normal_view,
+            &self.depth,
+            &self.post_sampler,
         );
         self.depth_size = size;
         self.opaque_key = None;
@@ -484,11 +679,13 @@ impl Renderer3d {
                     scene.look.tint[0],
                     scene.look.tint[1],
                     scene.look.tint[2],
-                    1.0,
+                    scene.look.exposure,
                 ],
                 lamps: scene.look.lamps,
                 light_vp: scene.look.light_vp,
                 screen: [self.depth_size.0 as f32, self.depth_size.1 as f32, 0.0, 0.0],
+                inv_view_proj: scene.view_proj.inverse().to_cols_array_2d(),
+                ssao: [scene.look.ssao, 0.09, 0.012, 0.0],
             }),
         );
         mesh.iter()
@@ -595,8 +792,10 @@ impl Renderer3d {
         scene.look.ambient.to_bits().hash(&mut hasher);
         scene.look.diffuse.to_bits().hash(&mut hasher);
         scene.look.tint.map(f32::to_bits).hash(&mut hasher);
+        scene.look.exposure.to_bits().hash(&mut hasher);
         scene.look.clear.map(f32::to_bits).hash(&mut hasher);
         scene.look.shadows.to_bits().hash(&mut hasher);
+        scene.look.ssao.to_bits().hash(&mut hasher);
         scene.look.lamp_count.to_bits().hash(&mut hasher);
         for lamp in &scene.look.lamps {
             lamp.map(f32::to_bits).hash(&mut hasher);
@@ -612,20 +811,31 @@ impl Renderer3d {
             {
                 let mut pass = opaque_enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("scene3d opaque pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.msaa_view,
-                        resolve_target: Some(&self.opaque_view),
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: scene.look.clear[0] as f64,
-                                g: scene.look.clear[1] as f64,
-                                b: scene.look.clear[2] as f64,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &self.msaa_view,
+                            resolve_target: Some(&self.opaque_view),
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: scene.look.clear[0] as f64,
+                                    g: scene.look.clear[1] as f64,
+                                    b: scene.look.clear[2] as f64,
+                                    a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &self.normal_msaa_view,
+                            resolve_target: Some(&self.normal_view),
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                    ],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &self.depth,
                         depth_ops: Some(wgpu::Operations {
@@ -695,19 +905,31 @@ impl Renderer3d {
         }
 
         // Glass pass loads the opaque MSAA colour, blends glass on top and
-        // resolves to the final view.
+        // resolves to an internal single-sample scene target. The SSAO pass
+        // below reads that target and writes the caller's view.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene3d glass pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_view,
-                    resolve_target: Some(view),
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.msaa_view,
+                        resolve_target: Some(&self.scene_view),
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.normal_msaa_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
@@ -728,6 +950,31 @@ impl Renderer3d {
                 pass.draw_indexed(0..self.glass_len, 0, 0..1);
             }
         }
+
+        // Screen-space AO pass. Depth is multisampled and sampled at sample
+        // zero; the scene is already resolved, so this is a plain full-screen
+        // triangle with no extra geometry or depth prepass.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene3d post pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.post_pipeline);
+            pass.set_bind_group(0, &self.post_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -738,6 +985,9 @@ fn make_main_bind_groups(
     shadow_views: &[wgpu::TextureView; 2],
     shadow_sampler: &wgpu::Sampler,
     env: &envmap::EnvMap,
+    detail: &wgpu::TextureView,
+    albedo: &wgpu::TextureView,
+    detail_sampler: &wgpu::Sampler,
     opaque: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
     let mut groups = Vec::new();
@@ -773,6 +1023,18 @@ fn make_main_bind_groups(
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(opaque),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(detail),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(detail_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(albedo),
                 },
             ],
         }));
@@ -856,15 +1118,22 @@ fn scene_pipeline(
             module: shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: if glass {
-                    Some(wgpu::BlendState::ALPHA_BLENDING)
-                } else {
-                    None
-                },
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format,
+                    blend: if glass {
+                        Some(wgpu::BlendState::ALPHA_BLENDING)
+                    } else {
+                        None
+                    },
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: NORMAL_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
         }),
         multiview_mask: None,
         cache: None,
@@ -888,7 +1157,8 @@ fn create_depth(
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&Default::default())
@@ -959,6 +1229,111 @@ fn create_opaque(
         .create_view(&Default::default())
 }
 
+
+fn create_normal_msaa(
+    device: &wgpu::Device,
+    (width, height): (u32, u32),
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene3d normal msaa"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA,
+            dimension: wgpu::TextureDimension::D2,
+            format: NORMAL_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
+fn create_normal_resolve(
+    device: &wgpu::Device,
+    (width, height): (u32, u32),
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene3d normal resolve"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: NORMAL_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
+fn create_scene(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    (width, height): (u32, u32),
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene3d scene resolve"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
+fn make_post_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    scene: &wgpu::TextureView,
+    normal: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("scene3d post bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(scene),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(normal),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(depth),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
 const SHADER: &str = r#"
 struct U {
     view_proj: mat4x4<f32>,
@@ -969,6 +1344,8 @@ struct U {
     lamps: array<vec4<f32>, 8>,
     light_vp: mat4x4<f32>,
     screen: vec4<f32>,
+    inv_view_proj: mat4x4<f32>,
+    ssao: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var shadow_tex: texture_depth_2d;
@@ -976,6 +1353,9 @@ struct U {
 @group(0) @binding(3) var env_tex: texture_cube<f32>;
 @group(0) @binding(4) var env_samp: sampler;
 @group(0) @binding(5) var opaque_tex: texture_2d<f32>;
+@group(0) @binding(6) var detail_tex: texture_2d_array<f32>;
+@group(0) @binding(7) var detail_samp: sampler;
+@group(0) @binding(8) var pbr_tex: texture_2d_array<f32>;
 
 struct SkyOut {
     @builtin(position) frag: vec4<f32>,
@@ -993,7 +1373,7 @@ fn vs_sky(@builtin(vertex_index) vi: u32) -> SkyOut {
 }
 
 @fragment
-fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
+fn fs_sky(in: SkyOut) -> FragOut {
     // Daytime keeps the same warm paper field as the 2D sheet; night keeps
     // the original moody studio gradient. The tint is blue-dominant only in
     // the night look, so it is a reliable discriminator here.
@@ -1003,7 +1383,7 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let night_sky = gbase * warm * u.tint.xyz;
     let paper = vec3<f32>(0.965, 0.957, 0.941);
     let is_night = u.tint.b > u.tint.r + 0.04;
-    return vec4<f32>(select(paper, night_sky, is_night), 1.0);
+    return FragOut(vec4<f32>(select(paper, night_sky, is_night), 1.0), vec4<f32>(0.0, 0.0, 0.0, 0.0));
 }
 
 struct VIn {
@@ -1022,6 +1402,10 @@ struct VOut {
     @location(3) mat: vec3<f32>,
     @location(4) alpha: f32,
     @location(5) pattern: f32,
+};
+struct FragOut {
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec4<f32>,
 };
 
 @vertex
@@ -1054,11 +1438,143 @@ fn sun_shadow(wp: vec3<f32>) -> f32 {
             lit = lit + textureSampleCompare(shadow_tex, shadow_samp, uv + off, ndc.z - 0.0012);
         }
     }
-    return lit / 25.0;
+    // Fade the shadow to full sun near every side of the shadow frustum.
+    // The x/y square edge and the far-plane cut both project as hard lines
+    // across the ground; fading depth as well removes the band in the middle
+    // of an overview shot.
+    let edge = min(
+        min(1.0 - abs(ndc.x), 1.0 - abs(ndc.y)),
+        min(ndc.z, 1.0 - ndc.z),
+    );
+    let fade = smoothstep(0.0, 0.12, edge);
+    return mix(1.0, lit / 25.0, fade);
 }
 
 fn hash21(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+fn surface_uv(n: vec3<f32>, wp: vec3<f32>) -> vec2<f32> {
+    // Floors and ceilings use the plan plane; vertical faces use their
+    // dominant horizontal axis plus height so wood grain and fabric weave
+    // do not stretch when a surface stands up.
+    if (abs(n.y) > 0.65) {
+        return wp.xz;
+    }
+    if (abs(n.x) > abs(n.z)) {
+        return vec2<f32>(wp.z, wp.y);
+    }
+    return vec2<f32>(wp.x, wp.y);
+}
+
+fn pbr_layer(kind: f32) -> i32 {
+    // Mirrors surface_detail::albedo_map layer order.
+    if (kind < 0.5) { return 0; }
+    if (kind >= 0.5 && kind < 2.5) { return 1; }
+    if (kind >= 2.5 && kind < 3.5) { return 2; }
+    if (kind >= 3.5 && kind < 4.5) { return 3; }
+    if (kind >= 4.5 && kind < 5.5) { return 4; }
+    if (kind >= 5.5 && kind < 6.5) { return 5; }
+    if (kind >= 6.5 && kind < 7.5) { return 4; }
+    if (kind >= 9.5 && kind < 10.5) { return 3; }
+    if (kind >= 10.5 && kind < 11.5) { return 1; }
+    if (kind >= 11.5 && kind < 13.5) { return 5; }
+    if (kind >= 14.5 && kind < 15.5) { return 6; }
+    if (kind >= 15.5 && kind < 16.5) { return 7; }
+    return 0;
+}
+
+fn material_gradient(kind: f32, p: vec2<f32>) -> vec2<f32> {
+    // Small tangent-space slopes, not a full height field: enough to catch
+    // grazing light without the cost or aliasing of finite differences.
+    if (kind < 0.5) {
+        // Roller stipple on paint and plaster.
+        return vec2<f32>(hash21(floor(p * 700.0)) - 0.5,
+            hash21(floor(p * 700.0) + 3.1) - 0.5) * 0.010;
+    }
+    if (kind >= 14.5 && kind < 15.5) {
+        // Asphalt shingle granules.
+        return vec2<f32>(hash21(floor(p * 260.0)) - 0.5,
+            hash21(floor(p * 260.0) + 7.0) - 0.5) * 0.014;
+    }
+    if (kind >= 9.5 && kind < 10.5) {
+        // Woven upholstery.
+        return vec2<f32>(sin(p.x * 520.0), sin(p.y * 520.0)) * 0.020;
+    }
+    if (kind >= 10.5 && kind < 11.5) {
+        // Grain running across the board.
+        return vec2<f32>(cos(p.x * 92.0 + sin(p.y * 17.0) * 2.0), 0.0) * 0.010;
+    }
+    if (kind >= 12.5 && kind < 13.5) {
+        // Fired glaze stays nearly flat.
+        return vec2<f32>(0.0015, 0.0015);
+    }
+    if (kind >= 1.5 && kind < 2.5) {
+        // Floor board grain.
+        return vec2<f32>(cos(p.x * 78.0 + p.y * 14.0), 0.0) * 0.006;
+    }
+    if (kind >= 5.5 && kind < 6.5) {
+        // Grout joints read as shallow grooves.
+        let u = fract(p.x / 0.6);
+        let v = fract(p.y / 0.6);
+        let joint = select(0.0, 1.0, u < 0.018 || v < 0.018);
+        return vec2<f32>(joint, joint) * 0.020;
+    }
+    if (kind >= 6.5 && kind < 7.5) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    if (kind >= 15.5 && kind < 16.5) {
+        // Fine paper ribbing plus a little tooth.
+        return vec2<f32>(sin(p.x * 92.0) * 0.0045,
+            (hash21(floor(p * 180.0)) - 0.5) * 0.003);
+    }
+    return vec2<f32>(0.0, 0.0);
+}
+
+fn detail_slope(kind: f32, p: vec2<f32>) -> vec2<f32> {
+    // Normal-map atlas: plaster trowel, wood pores, fabric weave, mineral
+    // chips and shingle aggregate. The atlas repeats every 0.3–0.8 m and is
+    // mipmapped, so close-ups get grain without distant shimmer.
+    var layer = 0;
+    var scale = 0.5;
+    var strength = 0.0;
+    if (kind < 0.5) {
+        layer = 0; scale = 0.52; strength = 0.65;
+    } else if (kind >= 0.5 && kind < 2.5) {
+        layer = 1; scale = 0.30; strength = 0.70;
+    } else if (kind >= 2.5 && kind < 3.5) {
+        layer = 3; scale = 0.55; strength = 0.22;
+    } else if (kind >= 3.5 && kind < 4.5) {
+        layer = 2; scale = 0.18; strength = 0.55;
+    } else if (kind >= 4.5 && kind < 6.5) {
+        layer = 3; scale = 0.48; strength = 0.45;
+    } else if (kind >= 9.5 && kind < 10.5) {
+        layer = 2; scale = 0.15; strength = 1.0;
+    } else if (kind >= 10.5 && kind < 11.5) {
+        layer = 1; scale = 0.30; strength = 0.85;
+    } else if (kind >= 12.5 && kind < 13.5) {
+        layer = 3; scale = 0.48; strength = 0.35;
+    } else if (kind >= 14.5 && kind < 15.5) {
+        layer = 4; scale = 0.72; strength = 0.85;
+    } else if (kind >= 15.5 && kind < 16.5) {
+        layer = 0; scale = 0.32; strength = 0.25;
+    }
+    if (strength == 0.0) {
+        return vec2<f32>(0.0, 0.0);
+    }
+    let t = textureSample(detail_tex, detail_samp, p / scale, layer);
+    return (t.xy * 2.0 - 1.0) * (strength * 0.55);
+}
+
+fn material_normal(n: vec3<f32>, grad: vec2<f32>) -> vec3<f32> {
+    if (abs(grad.x) + abs(grad.y) < 1e-5) {
+        return n;
+    }
+    let reference = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
+        abs(n.y) > 0.9);
+    let t = normalize(cross(reference, n));
+    let b = cross(n, t);
+    return normalize(n - t * grad.x - b * grad.y);
 }
 
 fn floor_albedo(c: vec3<f32>, kind: f32, p: vec2<f32>) -> vec3<f32> {
@@ -1071,20 +1587,43 @@ fn floor_albedo(c: vec3<f32>, kind: f32, p: vec2<f32>) -> vec3<f32> {
         let night = vec3<f32>(0.07, 0.074, 0.08);
         return select(paper, night, is_night);
     }
+    // Asphalt shingles on the roof: staggered courses with a dark joint
+    // and coarse aggregate rather than one flat brown plane.
+    if (kind >= 14.5 && kind < 15.5) {
+        let row = floor(p.y / 0.32);
+        let off = hash21(vec2<f32>(row, 5.0)) * 0.80;
+        let px = fract((p.x + off) / 0.92);
+        let py = fract(p.y / 0.32);
+        let seam = select(1.0, 0.62, py < 0.045 || px < 0.035);
+        let tile = floor((p.x + off) / 0.92);
+        let tone = hash21(vec2<f32>(row * 13.0, tile * 7.0)) * 0.18;
+        let gran = hash21(floor(p * 620.0)) * 0.09 + hash21(floor(p * 130.0)) * 0.04;
+        return c * seam * (0.88 + tone + gran);
+    }
+    // Wallpaper: a faint vertical rib with a very low-contrast motif, so it
+    // reads as paper rather than a printed poster.
+    if (kind >= 15.5 && kind < 16.5) {
+        let rib = sin(p.x * 135.0) * 0.5 + 0.5;
+        let motif = sin(p.x * 13.0 + sin(p.y * 9.0) * 1.4)
+            * sin(p.y * 15.0 + 0.6) * 0.5 + 0.5;
+        return c * (0.94 + rib * 0.035 + motif * 0.012);
+    }
     // Furniture surfaces: 10 fabric, 11 wood, 12 brushed metal,
     // 13 glazed ceramic, 14 mirror.
     if (kind >= 9.5) {
         if (kind < 10.5) {
             let weave = sin(p.x * 320.0) * sin(p.y * 320.0);
             let slub = sin(p.x * 62.0 + sin(p.y * 41.0) * 1.7);
-            return c * (0.955 + weave * 0.042 + slub * 0.024);
+            return c * (0.945 + weave * 0.070 + slub * 0.035);
         }
         if (kind < 11.5) {
-            let warp = sin(p.x * 11.0 + p.y * 4.0) * 2.0 + sin(p.y * 23.0) * 0.7;
-            let grain = sin(p.x * 92.0 + warp) * 0.5 + 0.5;
-            let ring = sin(p.y * 51.0 + warp * 1.9) * 0.5 + 0.5;
-            let tone = 0.83 + grain * 0.10 + ring * 0.05;
-            return c * tone * (0.97 + hash21(floor(p * 55.0)) * 0.035);
+            // Fine, mostly straight grain: a little cathedral warp, no water
+            // ripples across cabinet fronts and door leaves.
+            let warp = sin(p.y * 7.0) * 0.55 + sin(p.x * 2.5) * 0.25;
+            let grain = sin(p.x * 155.0 + warp) * 0.5 + 0.5;
+            let ring = sin(p.y * 38.0 + warp * 1.4) * 0.5 + 0.5;
+            let tone = 0.84 + grain * 0.10 + ring * 0.025;
+            return c * tone * (0.97 + hash21(floor(p * 90.0)) * 0.030);
         }
         if (kind < 12.5) {
             let brush = sin(p.y * 2100.0 + p.x * 19.0) * 0.016
@@ -1099,10 +1638,11 @@ fn floor_albedo(c: vec3<f32>, kind: f32, p: vec2<f32>) -> vec3<f32> {
         return c * (0.97 + sin(p.y * 900.0 + p.x * 7.0) * 0.018);
     }
     if (kind < 0.5) {
-        // Plain walls and matte fronts get a faint plaster grain instead of
+        // Plain walls and matte fronts get a plaster/roller grain instead of
         // reading as flat plastic under the sun.
-        let grain = (hash21(floor(p * 360.0)) - 0.5) * 0.014
-            + sin(p.x * 41.0 + p.y * 37.0) * 0.004;
+        let grain = (hash21(floor(p * 300.0)) - 0.5) * 0.030
+            + sin(p.x * 37.0 + p.y * 29.0) * 0.007
+            + sin(p.y * 13.0 + sin(p.x * 9.0) * 2.0) * 0.004;
         return c * (1.0 + grain);
     }
     // Wood planks: staggered rows with a darker joint and fine grain.
@@ -1148,7 +1688,7 @@ fn floor_albedo(c: vec3<f32>, kind: f32, p: vec2<f32>) -> vec3<f32> {
 }
 
 @fragment
-fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> FragOut {
     // Optical glass: sample the resolved opaque pass through a refraction
     // offset, tint it and add a Fresnel edge. Replaces alpha blending so the
     // background is never composited twice.
@@ -1178,7 +1718,10 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let tint = mix(vec3<f32>(1.0, 1.0, 1.0), in.albedo, 0.22 + thick * 3.0);
         let fres = pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 3.0);
         let refl = textureSampleLevel(env_tex, env_samp, reflect(-v, n), 0.6).rgb * u.tint.xyz;
-        return vec4<f32>(bg * tint + refl * fres * 0.85, 1.0);
+        return FragOut(
+            vec4<f32>(bg * tint + refl * fres * 0.85, 1.0),
+            vec4<f32>(0.0, 0.0, 0.0, 0.0),
+        );
     }
     // Materials are built as single-sided shells but drawn without culling:
     // flip the normal on back faces or the inside of a wall reads as a black
@@ -1187,20 +1730,30 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     if (!front && (in.pattern < 0.5 || in.pattern >= 9.5)) {
         n = -n;
     }
-    var albedo = floor_albedo(in.albedo, in.pattern, in.world.xz);
+    let surface = surface_uv(n, in.world);
+    var albedo = floor_albedo(in.albedo, in.pattern, surface);
+    // PBR albedo atlas: tiling 256px maps add per-material grain and a
+    // micro-roughness value in alpha. The base colour still comes from the
+    // document, so custom finishes remain custom.
+    let pbr = textureSample(pbr_tex, detail_samp, surface / 0.55, pbr_layer(in.pattern));
+    albedo = albedo * mix(vec3<f32>(1.0, 1.0, 1.0), pbr.rgb, 0.38);
+    let grad = material_gradient(in.pattern, surface) + detail_slope(in.pattern, surface);
+    n = material_normal(n, grad);
     // A slim timber skirting reads as a baseboard and gives the large white
     // wall planes a grounded edge.
-    if (in.pattern < 0.5) {
+    if (in.pattern < 0.5 || (in.pattern >= 15.5 && in.pattern < 16.5)) {
         albedo = mix(albedo, vec3<f32>(0.34, 0.26, 0.19),
             0.52 * (1.0 - smoothstep(0.08, 0.105, in.world.y)));
     }
     let l = normalize(-u.light.xyz);
     let v = normalize(u.eye.xyz - in.world);
     let diff = max(dot(n, l), 0.0);
-    var rough = clamp(in.mat.x, 0.04, 1.0);
+    var rough = clamp(in.mat.x * 0.72 + pbr.a * 0.28, 0.04, 1.0);
     let metal = clamp(in.mat.y, 0.0, 1.0);
     let glow = in.mat.z;
-    if (in.pattern >= 9.5) {
+    if (in.pattern >= 14.5 && in.pattern < 15.5) {
+        rough = max(rough, 0.88);
+    } else if (in.pattern >= 9.5) {
         if (in.pattern < 10.5) {
             rough = max(rough, 0.94);
         } else if (in.pattern < 11.5) {
@@ -1252,10 +1805,167 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         * select(0.0, 0.065, in.pattern >= 9.5 && in.pattern < 10.5)
         * (1.0 - metal);
     let emissive = albedo * glow;
-    // ACES filmic curve (the same look the web viewer uses), exposure 1.05.
-    let e = (base + plus_spec + albedo * sheen + emissive) * 1.05;
+    // ACES filmic curve (the same look the web viewer uses). A slightly lower
+    // exposure keeps white walls and pale floors from clipping to a flat sheet
+    // and lets the material gradients survive.
+    let e = (base + plus_spec + albedo * sheen + emissive) * u.tint.w;
     let toned = (e * (2.51 * e + 0.03)) / (e * (2.43 * e + 0.59) + 0.14);
-    return vec4<f32>(toned, in.alpha);
+    return FragOut(
+        vec4<f32>(toned, in.alpha),
+        vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0),
+    );
+}
+"#;
+
+const POST_SHADER: &str = r#"
+struct U {
+    view_proj: mat4x4<f32>,
+    light: vec4<f32>,
+    eye: vec4<f32>,
+    shade: vec4<f32>,
+    tint: vec4<f32>,
+    lamps: array<vec4<f32>, 8>,
+    light_vp: mat4x4<f32>,
+    screen: vec4<f32>,
+    inv_view_proj: mat4x4<f32>,
+    ssao: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var scene_tex: texture_2d<f32>;
+@group(0) @binding(2) var normal_tex: texture_2d<f32>;
+@group(0) @binding(3) var depth_tex: texture_depth_multisampled_2d;
+@group(0) @binding(4) var scene_samp: sampler;
+
+struct PostOut {
+    @builtin(position) frag: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_post(@builtin(vertex_index) vi: u32) -> PostOut {
+    var corners = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var out: PostOut;
+    let p = corners[vi];
+    out.frag = vec4<f32>(p, 0.0, 1.0);
+    out.uv = p * 0.5 + 0.5;
+    return out;
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+fn depth_world(uv: vec2<f32>, d: f32) -> vec3<f32> {
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let h = u.inv_view_proj * vec4<f32>(ndc, d, 1.0);
+    return h.xyz / max(h.w, 1e-5);
+}
+
+fn load_depth(coord: vec2<i32>) -> f32 {
+    let hi = vec2<i32>(i32(u.screen.x) - 1, i32(u.screen.y) - 1);
+    let c = clamp(coord, vec2<i32>(0, 0), hi);
+    // Nearest of the four MSAA samples. Sample zero alone can contain the
+    // background at silhouette pixels while the resolved colour contains the
+    // object, which used to leave bright halos around furniture and walls.
+    var d = 1.0;
+    for (var s: i32 = 0; s < 4; s = s + 1) {
+        d = min(d, textureLoad(depth_tex, c, s));
+    }
+    return d;
+}
+
+@fragment
+fn fs_post(in: PostOut) -> @location(0) vec4<f32> {
+    let hi = vec2<i32>(i32(u.screen.x) - 1, i32(u.screen.y) - 1);
+    let coord = clamp(vec2<i32>(i32(in.frag.x), i32(in.frag.y)), vec2<i32>(0, 0), hi);
+    let scene = textureLoad(scene_tex, coord, 0);
+    let d0 = load_depth(coord);
+    if (d0 >= 0.9999 || u.ssao.x <= 0.0) {
+        return vec4<f32>(scene.rgb, 1.0);
+    }
+
+    // Normal G-buffer written by the opaque pass. Glass and sky write a
+    // zero alpha mask, so transparent panes are not mistaken for solid
+    // occluders. This also removes the silhouette halos a depth-derived
+    // normal produced at furniture and wall edges.
+    let normal_sample = textureLoad(normal_tex, coord, 0);
+    let world = depth_world(in.uv, d0);
+    let viewdir = normalize(u.eye.xyz - world);
+    var n = normalize(normal_sample.rgb * 2.0 - vec3<f32>(1.0));
+    if (normal_sample.a < 0.5) {
+        // Glass and thin panes leave the normal mask at zero. Reconstruct
+        // the normal from the depth behind the pane so the transparent area
+        // does not become a bright un-AO'd stripe across the room.
+        let texel = vec2<f32>(1.0 / u.screen.x, 1.0 / u.screen.y);
+        let dl = depth_world(max(in.uv - vec2<f32>(texel.x, 0.0), vec2<f32>(0.0)), load_depth(coord - vec2<i32>(1, 0)));
+        let dr = depth_world(min(in.uv + vec2<f32>(texel.x, 0.0), vec2<f32>(1.0)), load_depth(coord + vec2<i32>(1, 0)));
+        let du = depth_world(max(in.uv - vec2<f32>(0.0, texel.y), vec2<f32>(0.0)), load_depth(coord - vec2<i32>(0, 1)));
+        let dd = depth_world(min(in.uv + vec2<f32>(0.0, texel.y), vec2<f32>(1.0)), load_depth(coord + vec2<i32>(0, 1)));
+        let nraw = cross(dr - dl, dd - du);
+        if (dot(nraw, nraw) < 1e-8) {
+            n = viewdir;
+        } else {
+            n = normalize(nraw);
+        }
+    }
+    if (dot(n, viewdir) < 0.0) {
+        n = -n;
+    }
+
+    // Hemisphere kernel in world space. Twelve taps are enough for room
+    // corners and furniture contact; rotating the kernel per pixel hides the
+    // banding that a fixed pattern would otherwise leave on large walls.
+    let radius = clamp(u.ssao.y, 0.08, 1.2);
+    let bias = clamp(u.ssao.z, 0.0, 0.2);
+    // A fixed low-discrepancy rosette is smoother than a per-pixel random
+    // rotation for single-frame exports; the latter turns the AO term itself
+    // into visible speckle on large white floors.
+    let seed = 0.0;
+    let axis = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+    let tangent = normalize(cross(axis, n));
+    let bitangent = cross(n, tangent);
+    var occlusion = 0.0;
+    var taps = 0.0;
+    for (var i: i32 = 0; i < 16; i = i + 1) {
+        let fi = f32(i);
+        let angle = (fi + seed * 6.2831853) * 2.3999632;
+        let radial = sqrt((fi + 0.5) / 16.0);
+        let dir = normalize(
+            tangent * cos(angle) * radial
+            + bitangent * sin(angle) * radial
+            + n * (1.0 - radial * radial * 0.5)
+        );
+        let p = world + dir * radius;
+        let clip = u.view_proj * vec4<f32>(p, 1.0);
+        if (clip.w <= 0.0001) {
+            continue;
+        }
+        var suv = clip.xy / clip.w * 0.5 + 0.5;
+        suv.y = 1.0 - suv.y;
+        if (suv.x <= 0.0 || suv.x >= 1.0 || suv.y <= 0.0 || suv.y >= 1.0) {
+            continue;
+        }
+        let sc = vec2<i32>(suv * u.screen.xy);
+        let sd = load_depth(sc);
+        if (sd >= 0.9999) {
+            continue;
+        }
+        let sp = depth_world(suv, sd);
+        let delta = sp - world;
+        let dist2 = dot(delta, delta);
+        if (dist2 <= 0.00015 || dist2 >= radius * radius) {
+            continue;
+        }
+        let nd = dot(normalize(delta), n);
+        if (nd > bias) {
+            occlusion += (1.0 - dist2 / (radius * radius)) * (nd - bias);
+            taps += 1.0;
+        } else {
+            taps += 1.0;
+        }
+    }
+    let ao = 1.0 - clamp(occlusion / max(taps, 1.0) * u.ssao.x * 1.0, 0.0, 0.22);
+    return vec4<f32>(scene.rgb * ao, 1.0);
 }
 "#;
 

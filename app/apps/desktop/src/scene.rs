@@ -1,23 +1,45 @@
 //! Editor state: document, history, camera and every pointer/keyboard gesture.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use fp_core::{EntityId, Mm, Pt};
-use fp_geom::{detect_rooms, distance_point_segment, point_in_polygon, snap_to_grid};
+use fp_geom::{ROOM_JOIN_TOLERANCE_MM, detect_rooms, distance_point_segment, point_in_polygon, snap_to_grid};
 use fp_history::{Command, History};
 use fp_model::catalog::{CATALOG, FurnitureCategory};
-use fp_model::{Document, Furniture, Measure, Opening, OpeningKind, Room, Wall, WallKind};
+use fp_model::{
+    Document, FinishSurface, Furniture, Level, Material, Measure, Opening, OpeningKind,
+    QuoteSettings, RoofKind, RoofSettings, Room, Stair, Wall, WallFinish, WallKind,
+};
 use fp_render2d::camera::{MAX_SCALE, MIN_SCALE};
 use fp_render2d::{
     Batch, Camera2D, Color, QuadVertex, build_grid, build_opening_batch, build_room_fills,
-    build_wall_batch, build_wall_batch_visible,
+    build_wall_batch, build_wall_batch_visible, build_wall_finish_batch,
 };
 use fp_render2d::{build_furniture_batch, hit as furniture_hit};
+
+/// Point-in-rotated-rectangle test for a straight stair, in plan millimetres.
+fn point_in_stair(stair: &Stair, p: Pt, pad_mm: f32) -> bool {
+    let dx = (stair.end.x - stair.start.x) as f32;
+    let dy = (stair.end.y - stair.start.y) as f32;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0 {
+        return false;
+    }
+    let ux = dx / len;
+    let uy = dy / len;
+    let along = (p.x - stair.start.x) as f32 * ux + (p.y - stair.start.y) as f32 * uy;
+    let across = -(p.x - stair.start.x) as f32 * uy + (p.y - stair.start.y) as f32 * ux;
+    along >= -pad_mm
+        && along <= len + pad_mm
+        && across.abs() <= stair.width_mm as f32 * 0.5 + pad_mm
+}
 use fp_render3d::{
-    EYE_HEIGHT, MAX_DISTANCE, MeshVertex, OrbitCamera, WalkCamera, ceiling_mesh, floor_mesh,
-    wall_mesh_with_openings,
+    EYE_HEIGHT, MAX_DISTANCE, MeshVertex, OrbitCamera, WalkCamera, ceiling_mesh_with_materials,
+    floor_mesh, wall_mesh_with_finishes,
 };
 use fp_ui::{
     DEFAULT_GRID_MM, DragSession, Tool, blocked_along_move, clamp_offset, constrained_end,
@@ -51,6 +73,7 @@ pub enum InspectorAction {
     OpeningSetWidth(i32),
     OpeningSetHeight(i32),
     OpeningSetSill(i32),
+    OpeningSetPrice(i32),
     RemoveOpening,
     CycleMaterial,
     SetMaterial(EntityId),
@@ -63,6 +86,7 @@ pub enum InspectorAction {
     FurnitureSetDepth(i32),
     FurnitureSetX(i32),
     FurnitureSetY(i32),
+    FurnitureSetPrice(i32),
     FurnitureColor,
     FurnitureSetColor(&'static str),
     FurnitureBringFront,
@@ -78,12 +102,27 @@ pub enum InspectorAction {
     OpeningFlipSwing,
     /// Move the hinge from the left jamb to the right jamb or vice versa.
     OpeningFlipHinge,
+    /// Change the selected wall's finishing material.
+    SetWallFinish(WallFinish),
+    /// Choose a finish record from the wall finish library.
+    SetWallFinishMaterial(EntityId),
+    /// Apply one finish to every selected wall.
+    ApplyWallFinishToSelection(EntityId),
+    /// Copy the selected wall's finish to every wall on its floor.
+    ApplyWallFinishToFloor,
+    /// Choose a finish record for the selected room's ceiling.
+    SetCeilingMaterial(EntityId),
+    StairSetWidth(i32),
+    StairSetSteps(u32),
+    StairReverse,
+    RemoveStair,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InspectorEdit {
     FurnitureWidth,
     FurnitureDepth,
+    FurniturePrice,
     FurnitureX,
     FurnitureY,
     WallLength,
@@ -92,6 +131,9 @@ pub enum InspectorEdit {
     OpeningWidth,
     OpeningHeight,
     OpeningSill,
+    OpeningPrice,
+    StairWidth,
+    StairSteps,
 }
 
 impl InspectorEdit {
@@ -116,6 +158,7 @@ pub enum InspectorKind {
     OpeningDoor,
     OpeningWindow,
     Room,
+    Stair,
     Multi,
 }
 
@@ -129,10 +172,17 @@ pub struct InspectorView {
     pub swatches: Vec<(String, &'static str, bool)>,
     pub lines: Vec<String>,
     pub actions: Vec<(&'static str, InspectorAction)>,
-    /// Direct flooring choices for a selected room. Empty for other objects.
-    pub material_options: Vec<(String, EntityId, bool)>,
+    /// Direct flooring choices for a selected room: (name, hex, id, active).
+    /// Empty for other objects.
+    pub material_options: Vec<(String, String, EntityId, bool)>,
+    /// Wall finish choices from the finish library.
+    pub wall_finish_options: Vec<(String, String, EntityId, bool)>,
+    /// Ceiling finish choices for a selected room.
+    pub ceiling_options: Vec<(String, String, EntityId, bool)>,
     /// Current wall construction kind, for the inspector's type dropdown.
     pub wall_kind: Option<WallKind>,
+    /// Current wall finish, for the inspector's finish chips.
+    pub wall_finish: Option<WallFinish>,
 }
 
 /// Ground-material quote, including the 5% cutting allowance used by the web
@@ -155,6 +205,11 @@ fn wall_kind_name(kind: WallKind) -> &'static str {
 }
 
 const HIGHLIGHT_3D: [f32; 3] = [0.96, 0.58, 0.16];
+
+/// Screen-space radius for wall endpoint / centreline snapping. At the default
+/// plan zoom this is roughly 200 mm, enough to catch a corner drawn one wall
+/// thickness away without pulling unrelated walls together.
+const WALL_SNAP_PX: f32 = 10.0;
 
 /// Fabric swatches shown in the furniture inspector. These are neutral,
 /// architectural tones from the design demo rather than an arbitrary rainbow.
@@ -217,13 +272,24 @@ fn ray_box(origin: Vec3, dir: Vec3, centre: Vec3, half: Vec3, angle: f32) -> Opt
 
 /// Nearest hit along a ray through the extruded scene (metres).
 pub fn pick_scene(doc: &Document, origin: Vec3, dir: Vec3) -> Option<Pick3d> {
+    pick_scene_at(doc, origin, dir, 0, 0.0)
+}
+
+/// Storey-aware pick. `elevation` is the storey's floor height in metres.
+pub fn pick_scene_at(
+    doc: &Document,
+    origin: Vec3,
+    dir: Vec3,
+    floor: u32,
+    elevation: f32,
+) -> Option<Pick3d> {
     let mut best: Option<(f32, Pick3d)> = None;
     let mut consider = |t: f32, hit: Pick3d| {
         if best.is_none_or(|(bt, _)| t < bt) {
             best = Some((t, hit));
         }
     };
-    for item in &doc.furniture {
+    for item in doc.furniture.iter().filter(|f| f.floor == floor) {
         let height = CATALOG
             .iter()
             .find(|s| s.asset_id == item.asset_id)
@@ -231,7 +297,7 @@ pub fn pick_scene(doc: &Document, origin: Vec3, dir: Vec3) -> Option<Pick3d> {
             .unwrap_or(0.75);
         let centre = Vec3::new(
             item.center.x as f32 / 1000.0,
-            height * 0.5,
+            height * 0.5 + elevation,
             item.center.y as f32 / 1000.0,
         );
         let half = Vec3::new(
@@ -249,7 +315,7 @@ pub fn pick_scene(doc: &Document, origin: Vec3, dir: Vec3) -> Option<Pick3d> {
             consider(t, Pick3d::Furniture(item.id));
         }
     }
-    for wall in &doc.walls {
+    for wall in doc.walls.iter().filter(|w| w.floor == floor) {
         let dx = (wall.end.x - wall.start.x) as f32;
         let dz = (wall.end.y - wall.start.y) as f32;
         let len = (dx * dx + dz * dz).sqrt();
@@ -258,7 +324,7 @@ pub fn pick_scene(doc: &Document, origin: Vec3, dir: Vec3) -> Option<Pick3d> {
         }
         let centre = Vec3::new(
             (wall.start.x + wall.end.x) as f32 / 2000.0,
-            wall.height_mm as f32 / 2000.0,
+            wall.height_mm as f32 / 2000.0 + elevation,
             (wall.start.y + wall.end.y) as f32 / 2000.0,
         );
         let half = Vec3::new(
@@ -271,14 +337,14 @@ pub fn pick_scene(doc: &Document, origin: Vec3, dir: Vec3) -> Option<Pick3d> {
         }
     }
     if dir.y.abs() > 1e-6 {
-        let t = -origin.y / dir.y;
+        let t = (elevation - origin.y) / dir.y;
         if t >= 0.0 {
             let point = origin + dir * t;
             let plan_point = Pt::new(
                 (point.x * 1000.0).round() as i32,
                 (point.z * 1000.0).round() as i32,
             );
-            for room in &doc.rooms {
+            for room in doc.rooms.iter().filter(|r| r.floor == floor) {
                 if point_in_polygon(plan_point, &room.polygon) {
                     consider(t, Pick3d::Room(room.id));
                 }
@@ -417,6 +483,8 @@ pub struct SceneState {
     pub space_down: bool,
     pub lang: crate::i18n::Lang,
     pub cutaway: bool,
+    /// Draw the flat roof over the top storey in the 3D view.
+    pub show_roof: bool,
     /// Doors swung open in the walk view, by raw entity id.
     pub doors_open: Vec<u128>,
     pub night: bool,
@@ -427,6 +495,7 @@ pub struct SceneState {
     pub furniture_selection: Vec<EntityId>,
     rotate_drag: Option<RotateDrag>,
     pub selected_opening: Option<EntityId>,
+    pub selected_stair: Option<EntityId>,
     furniture_drag: Option<FurnitureDrag>,
     /// Set while a just-placed piece can still be dragged before pointer-up.
     placing: Option<PlaceDrag>,
@@ -444,6 +513,11 @@ pub struct SceneState {
     /// button would leave a default sofa icon under the button.
     pub pointer_over_ui: bool,
     pub view_size: [f32; 2],
+    /// Active storey (zero-based) shown and edited in the plan.
+    pub active_level: usize,
+    /// Modal owns the window: clear the plan surface to transparent so the
+    /// GPUI modal above it is not covered by the last opaque frame.
+    pub modal_clear: bool,
     pub saved_path: PathBuf,
     pub note: Option<String>,
     pub view: ViewMode,
@@ -521,6 +595,7 @@ impl SceneState {
             space_down: false,
             lang: crate::i18n::load_lang(),
             cutaway: true,
+            show_roof: false,
             doors_open: Vec::new(),
             night: false,
             sun: 0.5,
@@ -528,6 +603,7 @@ impl SceneState {
             furniture_selection: Vec::new(),
             rotate_drag: None,
             selected_opening: None,
+            selected_stair: None,
             furniture_drag: None,
             placing: None,
             opening_drag: None,
@@ -540,6 +616,8 @@ impl SceneState {
             pointer: [0.0, 0.0],
             pointer_over_ui: true,
             view_size: viewport,
+            active_level: 0,
+            modal_clear: false,
             saved_path,
             note: None,
             view: match std::env::var("FP_START_VIEW").as_deref() {
@@ -570,6 +648,250 @@ impl SceneState {
     // ------------------------------------------------------------- geometry
 
     /// Static scene geometry for any camera; PNG export reuses this.
+    /// Zero-based active storey, clamped to the document's level range.
+    pub fn floor_index(&self) -> usize {
+        self.active_level
+            .min(self.doc.level_count().saturating_sub(1))
+    }
+
+    pub fn floor(&self) -> u32 {
+        self.floor_index() as u32
+    }
+
+    pub fn floor_name(&self) -> String {
+        self.doc.level_name(self.floor_index())
+    }
+
+    pub fn walls_for_floor(&self, floor: u32) -> Vec<Wall> {
+        self.doc
+            .walls
+            .iter()
+            .filter(|w| w.floor == floor)
+            .cloned()
+            .collect()
+    }
+
+    pub fn rooms_for_floor(&self, floor: u32) -> Vec<Room> {
+        self.doc
+            .rooms
+            .iter()
+            .filter(|r| r.floor == floor)
+            .cloned()
+            .collect()
+    }
+
+    pub fn stairs_for_floor(&self, floor: u32) -> Vec<Stair> {
+        self.doc
+            .stairs
+            .iter()
+            .filter(|s| s.floor == floor)
+            .cloned()
+            .collect()
+    }
+
+    pub fn furniture_for_floor(&self, floor: u32) -> Vec<Furniture> {
+        self.doc
+            .furniture
+            .iter()
+            .filter(|f| f.floor == floor)
+            .cloned()
+            .collect()
+    }
+
+    pub fn openings_for_floor(&self, floor: u32) -> Vec<Opening> {
+        self.doc
+            .openings
+            .iter()
+            .filter(|o| {
+                self.doc
+                    .walls
+                    .iter()
+                    .any(|w| w.id == o.wall_id && w.floor == floor)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Switch the storey shown in 2D/3D editing. Transient selections from the
+    /// old storey must not leak into the new one.
+    /// Add a storey above the current one. `copy_walls` clones the current
+    /// storey's wall shell (and its openings) so duplexes start from a usable
+    /// outline instead of a blank sheet.
+    pub fn add_level(&mut self, copy_walls: bool) {
+        let before = self.doc.clone();
+        let source = self.floor();
+        let index = self.doc.level_count();
+        let mut after = before.clone();
+        after.levels.push(Level {
+            name: format!("{}F", index + 1),
+            height_mm: 2800,
+        });
+        let floor = index as u32;
+        if copy_walls {
+            let mut raw = after.next_id();
+            let mut remap = std::collections::HashMap::new();
+            let source_walls: Vec<Wall> = after
+                .walls
+                .iter()
+                .filter(|w| w.floor == source)
+                .cloned()
+                .collect();
+            for mut wall in source_walls {
+                let id = EntityId(raw);
+                raw += 1;
+                remap.insert(wall.id, id);
+                wall.id = id;
+                wall.floor = floor;
+                after.walls.push(wall);
+            }
+            let source_openings: Vec<Opening> = after
+                .openings
+                .iter()
+                .filter(|o| remap.contains_key(&o.wall_id))
+                .cloned()
+                .collect();
+            for mut opening in source_openings {
+                opening.id = EntityId(raw);
+                raw += 1;
+                opening.wall_id = remap[&opening.wall_id];
+                after.openings.push(opening);
+            }
+            recompute_rooms(&mut after);
+        }
+        self.history.execute(
+            Box::new(LevelSnapshot {
+                before,
+                after,
+                label: "add level",
+            }),
+            &mut self.doc,
+        );
+        self.active_level = index;
+        self.note = Some(if copy_walls {
+            format!("已新增 {}F · 复制本层墙体和门窗", index + 1)
+        } else {
+            format!("已新增 {}F · 空白楼层", index + 1)
+        });
+        let elevation = self.doc.level_elevation_mm(index) as f32 / 1000.0;
+        self.cam3.target.y = elevation + 1.2;
+        self.walk.pos.y = elevation + EYE_HEIGHT;
+        self.selection.clear();
+        self.selected_room = None;
+        self.selected_furniture = None;
+        self.furniture_selection.clear();
+        self.sync_measurements();
+        self.touch();
+    }
+
+    /// Remove the current storey and shift every storey above it down.
+    pub fn remove_active_level(&mut self) {
+        if self.doc.level_count() <= 1 {
+            self.note = Some("至少保留一层".into());
+            return;
+        }
+        let index = self.floor_index() as u32;
+        let before = self.doc.clone();
+        let mut after = before.clone();
+        let removed_walls: Vec<EntityId> = after
+            .walls
+            .iter()
+            .filter(|w| w.floor == index)
+            .map(|w| w.id)
+            .collect();
+        after.walls.retain(|w| w.floor != index);
+        after
+            .openings
+            .retain(|o| !removed_walls.contains(&o.wall_id));
+        after.rooms.retain(|r| r.floor != index);
+        after.furniture.retain(|f| f.floor != index);
+        after.stairs.retain(|s| s.floor != index);
+        after.measures.retain(|m| m.floor != index);
+        for wall in &mut after.walls {
+            if wall.floor > index {
+                wall.floor -= 1;
+            }
+        }
+        for room in &mut after.rooms {
+            if room.floor > index {
+                room.floor -= 1;
+            }
+        }
+        for item in &mut after.furniture {
+            if item.floor > index {
+                item.floor -= 1;
+            }
+        }
+        for stair in &mut after.stairs {
+            if stair.floor > index {
+                stair.floor -= 1;
+            }
+        }
+        for measure in &mut after.measures {
+            if measure.floor > index {
+                measure.floor -= 1;
+            }
+        }
+        if let Some(underlay) = &mut after.underlay {
+            if underlay.floor > index {
+                underlay.floor -= 1;
+            } else if underlay.floor == index {
+                after.underlay = None;
+            }
+        }
+        after.levels.remove(index as usize);
+        for (i, level) in after.levels.iter_mut().enumerate() {
+            let old_index = if i < index as usize { i } else { i + 1 };
+            let auto_name = format!("{}F", old_index + 1);
+            if level.name == auto_name {
+                level.name = format!("{}F", i + 1);
+            }
+        }
+        self.history.execute(
+            Box::new(LevelSnapshot {
+                before,
+                after,
+                label: "remove level",
+            }),
+            &mut self.doc,
+        );
+        self.active_level = index.saturating_sub(1) as usize;
+        let elevation = self.doc.level_elevation_mm(self.active_level) as f32 / 1000.0;
+        self.cam3.target.y = elevation + 1.2;
+        self.walk.pos.y = elevation + EYE_HEIGHT;
+        self.selection.clear();
+        self.selected_room = None;
+        self.selected_opening = None;
+        self.selected_stair = None;
+        self.selected_furniture = None;
+        self.furniture_selection.clear();
+        self.sync_measurements();
+        self.touch();
+    }
+
+    pub fn set_level(&mut self, level: usize) {
+        let level = level.min(self.doc.level_count().saturating_sub(1));
+        if self.active_level == level {
+            return;
+        }
+        self.active_level = level;
+        let elevation = self.doc.level_elevation_mm(level) as f32 / 1000.0;
+        self.cam3.target.y = elevation + 1.2;
+        self.walk.pos.y = elevation + EYE_HEIGHT;
+        self.selection.clear();
+        self.selected_room = None;
+        self.selected_opening = None;
+        self.selected_stair = None;
+        self.selected_furniture = None;
+        self.furniture_selection.clear();
+        self.hover = None;
+        self.drag = None;
+        self.draft = None;
+        self.placing = None;
+        self.box_select = None;
+        self.sync_measurements();
+        self.touch();
+    }
+
     pub fn render_batch(
         &self,
         cam: &Camera2D,
@@ -577,8 +899,78 @@ impl SceneState {
         furniture_selection: &[EntityId],
         selected_room: Option<EntityId>,
     ) -> Batch {
+        self.render_batch_with(
+            self.floor(),
+            true,
+            true,
+            true,
+            false,
+            cam,
+            selection,
+            furniture_selection,
+            selected_room,
+        )
+    }
+
+    /// Render one storey without the interactive pointer ghosts or grid. Used
+    /// by the construction sheet exporter, which draws every floor from the
+    /// same plan.
+    pub fn render_batch_on(
+        &self,
+        floor: u32,
+        cam: &Camera2D,
+        selection: &[EntityId],
+        furniture_selection: &[EntityId],
+        selected_room: Option<EntityId>,
+    ) -> Batch {
+        self.render_batch_with(
+            floor,
+            false,
+            false,
+            true,
+            true,
+            cam,
+            selection,
+            furniture_selection,
+            selected_room,
+        )
+    }
+
+    /// Ground-finish drawing: walls, rooms and openings stay, furniture goes.
+    pub fn render_batch_finish_on(
+        &self,
+        floor: u32,
+        cam: &Camera2D,
+        selected_room: Option<EntityId>,
+    ) -> Batch {
+        self.render_batch_with(
+            floor,
+            false,
+            false,
+            false,
+            true,
+            cam,
+            &[],
+            &[],
+            selected_room,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_batch_with(
+        &self,
+        floor: u32,
+        show_grid: bool,
+        show_measurements: bool,
+        show_furniture: bool,
+        show_wall_finish: bool,
+        cam: &Camera2D,
+        selection: &[EntityId],
+        furniture_selection: &[EntityId],
+        selected_room: Option<EntityId>,
+    ) -> Batch {
         let mut batch = Batch::default();
-        if self.doc.settings.show_grid {
+        if show_grid && self.doc.settings.show_grid {
             let grid = build_grid(cam, 8.0);
             for l in &grid.minor {
                 push_thick_line(&mut batch, cam, l[0], l[1], 1.0, Color::GRID_MINOR);
@@ -587,21 +979,31 @@ impl SceneState {
                 push_thick_line(&mut batch, cam, l[0], l[1], 1.0, Color::GRID_MAJOR);
             }
         }
-        let fills = build_room_fills(&self.doc.rooms, &self.doc.materials, cam, selected_room);
+        let floor_rooms = self.rooms_for_floor(floor);
+        let floor_walls = self.walls_for_floor(floor);
+        let floor_openings = self.openings_for_floor(floor);
+        let fills = build_room_fills(&floor_rooms, &self.doc.materials, cam, selected_room);
         batch.vertices.extend(fills.vertices);
-        let walls = build_wall_batch_visible(
-            &self.doc.walls,
-            selection,
-            cam,
-            self.doc.settings.show_bearing,
-        );
+        let walls = if show_wall_finish {
+            build_wall_finish_batch(
+                &floor_walls,
+                &self.doc.materials,
+                cam,
+                self.doc.settings.show_bearing,
+            )
+        } else {
+            build_wall_batch_visible(&floor_walls, selection, cam, self.doc.settings.show_bearing)
+        };
         batch.vertices.extend(walls.vertices);
-        let openings = build_opening_batch(&self.doc.walls, &self.doc.openings, cam, &[]);
+        let openings = build_opening_batch(&floor_walls, &floor_openings, cam, &[]);
         batch.vertices.extend(openings.vertices);
-        if self.doc.settings.show_furniture {
-            let furniture = build_furniture_batch(&self.doc.furniture, cam, furniture_selection);
+        if show_furniture && self.doc.settings.show_furniture {
+            let floor_furniture = self.furniture_for_floor(floor);
+            let furniture = build_furniture_batch(&floor_furniture, cam, furniture_selection);
             batch.vertices.extend(furniture.vertices);
-            if let Some(item) = self.selected_furniture_item() {
+            if floor == self.floor()
+                && let Some(item) = self.selected_furniture_item()
+            {
                 {
                     let handle = self.furniture_handle(item);
                     let ink = Color([0.96, 0.58, 0.16, 1.0]);
@@ -622,18 +1024,70 @@ impl SceneState {
                 }
             }
         }
-        let ink = Color([0.10, 0.62, 0.58, 1.0]);
-        for measurement in &self.measurements {
-            push_dashed_line(
-                &mut batch,
-                &self.cam,
-                measurement.from,
-                measurement.to,
-                1.8,
-                ink,
+        for stair in self.stairs_for_floor(floor) {
+            let stair_ink = if self.selected_stair == Some(stair.id) {
+                Color([0.96, 0.58, 0.16, 1.0])
+            } else {
+                Color([0.55, 0.42, 0.20, 0.9])
+            };
+            let dx = (stair.end.x - stair.start.x) as f32;
+            let dy = (stair.end.y - stair.start.y) as f32;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1.0 {
+                continue;
+            }
+            let ux = dx / len;
+            let uy = dy / len;
+            let nx = -uy * stair.width_mm as f32 * 0.5;
+            let ny = ux * stair.width_mm as f32 * 0.5;
+            let a = Pt::new(
+                (stair.start.x as f32 + nx) as i32,
+                (stair.start.y as f32 + ny) as i32,
             );
-            push_world_cross(&mut batch, &self.cam, measurement.from, ink);
-            push_world_cross(&mut batch, &self.cam, measurement.to, ink);
+            let b = Pt::new(
+                (stair.start.x as f32 - nx) as i32,
+                (stair.start.y as f32 - ny) as i32,
+            );
+            let c = Pt::new(
+                (stair.end.x as f32 - nx) as i32,
+                (stair.end.y as f32 - ny) as i32,
+            );
+            let d = Pt::new(
+                (stair.end.x as f32 + nx) as i32,
+                (stair.end.y as f32 + ny) as i32,
+            );
+            for (p, q) in [(a, b), (b, c), (c, d), (d, a)] {
+                push_thick_line(&mut batch, cam, p, q, 1.8, stair_ink);
+            }
+            let steps = stair.steps.clamp(3, 40) as f32;
+            for i in 1..steps as i32 {
+                let t = i as f32 / steps;
+                let p = Pt::new(
+                    (stair.start.x as f32 + dx * t + nx) as i32,
+                    (stair.start.y as f32 + dy * t + ny) as i32,
+                );
+                let q = Pt::new(
+                    (stair.start.x as f32 + dx * t - nx) as i32,
+                    (stair.start.y as f32 + dy * t - ny) as i32,
+                );
+                push_thick_line(&mut batch, cam, p, q, 1.2, stair_ink.with_alpha(0.55));
+            }
+            let mid = Pt::new(
+                (stair.start.x + stair.end.x) / 2,
+                (stair.start.y + stair.end.y) / 2,
+            );
+            push_thick_line(&mut batch, cam, stair.start, mid, 2.4, stair_ink);
+        }
+        let ink = Color([0.10, 0.62, 0.58, 1.0]);
+        for measurement in self
+            .doc
+            .measures
+            .iter()
+            .filter(|m| m.floor == floor && show_measurements)
+        {
+            push_dashed_line(&mut batch, cam, measurement.a, measurement.b, 1.8, ink);
+            push_world_cross(&mut batch, cam, measurement.a, ink);
+            push_world_cross(&mut batch, cam, measurement.b, ink);
         }
         if self.tool == Tool::Measure
             && let Some(from) = self.measure_from
@@ -645,9 +1099,9 @@ impl SceneState {
                 1,
             );
             let ghost = ink.with_alpha(0.75);
-            push_dashed_line(&mut batch, &self.cam, from, to, 1.8, ghost);
-            push_world_cross(&mut batch, &self.cam, from, ink);
-            push_world_cross(&mut batch, &self.cam, to, ghost);
+            push_dashed_line(&mut batch, cam, from, to, 1.8, ghost);
+            push_world_cross(&mut batch, cam, from, ink);
+            push_world_cross(&mut batch, cam, to, ghost);
         }
 
         batch
@@ -688,7 +1142,12 @@ impl SceneState {
         let hover_target = self
             .hover
             .filter(|h| !self.selection.contains(h))
-            .and_then(|h| self.doc.walls.iter().find(|w| w.id == h));
+            .and_then(|h| {
+                self.doc
+                    .walls
+                    .iter()
+                    .find(|w| w.id == h && w.floor == self.floor())
+            });
         if let Some(w) = hover_target {
             let ghost = build_wall_batch(std::slice::from_ref(w), &[], &self.cam);
             for v in ghost.vertices {
@@ -746,6 +1205,9 @@ impl SceneState {
             return None;
         }
         let underlay = self.doc.underlay.as_ref()?;
+        if underlay.floor != self.floor() {
+            return None;
+        }
         let image = self.underlay_image.as_ref()?.clone();
         let a = self
             .cam
@@ -781,6 +1243,73 @@ impl SceneState {
     /// Toggle the cut-away height. This changes the extruded mesh, so it must
     /// bump the revision; otherwise the cached mesh and the renderer epoch stay
     /// put and the walls only update after the camera is dragged.
+    pub fn set_roof(&mut self, on: bool) {
+        if self.show_roof != on {
+            self.show_roof = on;
+            self.mesh_revision += 1;
+        }
+    }
+
+    pub fn roof_settings(&self) -> RoofSettings {
+        self.doc.roof.normalized()
+    }
+
+    fn commit_roof(&mut self, after: RoofSettings) {
+        let before = self.doc.roof.normalized();
+        let after = after.normalized();
+        if before == after {
+            return;
+        }
+        let mut doc = self.doc.clone();
+        doc.roof = after;
+        self.history.execute(
+            Box::new(RoofSnapshot {
+                before: self.doc.clone(),
+                after: doc,
+                label: "roof",
+            }),
+            &mut self.doc,
+        );
+        self.note = Some(match after.kind {
+            RoofKind::Flat => format!("平屋顶 · 檐口 {} mm", after.overhang_mm),
+            RoofKind::Gable => {
+                format!(
+                    "坡屋顶 {:.0}° · 檐口 {} mm",
+                    after.pitch_deg, after.overhang_mm
+                )
+            }
+        });
+        self.touch();
+    }
+
+    pub fn set_roof_kind(&mut self, kind: RoofKind) {
+        let mut after = self.roof_settings();
+        after.kind = kind;
+        self.commit_roof(after);
+    }
+
+    pub fn cycle_roof_pitch(&mut self) {
+        const PITCHES: [f32; 4] = [15.0, 25.0, 35.0, 45.0];
+        let mut after = self.roof_settings();
+        after.pitch_deg = PITCHES
+            .iter()
+            .copied()
+            .find(|p| *p > after.pitch_deg + 0.1)
+            .unwrap_or(PITCHES[0]);
+        self.commit_roof(after);
+    }
+
+    pub fn cycle_roof_overhang(&mut self) {
+        const EAVES: [i32; 4] = [300, 600, 900, 1_200];
+        let mut after = self.roof_settings();
+        after.overhang_mm = EAVES
+            .iter()
+            .copied()
+            .find(|m| *m > after.overhang_mm)
+            .unwrap_or(EAVES[0]);
+        self.commit_roof(after);
+    }
+
     pub fn set_cutaway(&mut self, on: bool) {
         if self.cutaway != on {
             self.cutaway = on;
@@ -803,19 +1332,99 @@ impl SceneState {
         self.mesh_revision += 1;
     }
 
+    /// Nearest existing wall endpoint or centreline projection. Drawing uses
+    /// this so a corner lands exactly on the previous wall instead of one grid
+    /// cell inside it, which is what made rooms fail to close.
+    fn wall_snap_candidate(&self, raw: Pt) -> Option<Pt> {
+        let walls = self.walls_for_floor(self.floor());
+        // Endpoint capture is deliberately at least 160 mm: a corner drawn
+        // with a half-wall-thickness miss must still weld. Projection below
+        // stays tighter so parallel walls do not collapse onto each other.
+        let tolerance = (WALL_SNAP_PX as f64 / self.cam.scale.max(1e-6)).clamp(160.0, 800.0);
+        // Projection is tighter than endpoint capture: a wall drawn parallel
+        // 15 cm away should stay parallel, not jump onto its neighbour.
+        let projection_tolerance = (WALL_SNAP_PX as f64 * 0.6 / self.cam.scale.max(1e-6))
+            .clamp(60.0, 500.0);
+        let mut best: Option<(f64, Pt)> = None;
+
+        for wall in &walls {
+            for candidate in [wall.start, wall.end] {
+                let distance =
+                    ((raw.x - candidate.x) as f64).hypot((raw.y - candidate.y) as f64);
+                if distance <= tolerance
+                    && best.is_none_or(|(best_distance, _)| distance < best_distance)
+                {
+                    best = Some((distance, candidate));
+                }
+            }
+        }
+
+        // A corner endpoint wins even when the pointer also lies exactly on
+        // the wall's centreline: that is the difference between "extend the
+        // wall by 35 mm" and "start at the existing corner".
+        if let Some((_, endpoint)) = best {
+            return Some(endpoint);
+        }
+
+        for wall in &walls {
+            let dx = (wall.end.x - wall.start.x) as f64;
+            let dy = (wall.end.y - wall.start.y) as f64;
+            let len_sq = dx * dx + dy * dy;
+            if len_sq < 1.0 {
+                continue;
+            }
+            let t = (((raw.x - wall.start.x) as f64) * dx
+                + ((raw.y - wall.start.y) as f64) * dy)
+                / len_sq;
+            if !(0.0..=1.0).contains(&t) {
+                continue;
+            }
+            let projection = Pt::new(
+                (wall.start.x as f64 + dx * t).round() as Mm,
+                (wall.start.y as f64 + dy * t).round() as Mm,
+            );
+            let distance =
+                ((raw.x - projection.x) as f64).hypot((raw.y - projection.y) as f64);
+            if distance <= projection_tolerance
+                && best.is_none_or(|(best_distance, _)| distance < best_distance)
+            {
+                best = Some((distance, projection));
+            }
+        }
+
+        best.map(|(_, point)| point)
+    }
+
+    fn snap_wall_start(&self, raw: Pt) -> Pt {
+        self.wall_snap_candidate(raw).unwrap_or_else(|| {
+            Pt::new(
+                snap_to_grid(raw.x, DEFAULT_GRID_MM),
+                snap_to_grid(raw.y, DEFAULT_GRID_MM),
+            )
+        })
+    }
+
+    /// Keep the orthogonal constraint, then let a nearby joint win over the
+    /// projected grid point. Accepting the joint is what makes corners exact.
+    fn snap_wall_end(&self, start: Pt, raw: Pt) -> Pt {
+        self.wall_snap_candidate(raw)
+            .unwrap_or_else(|| constrained_end(start, raw, true, DEFAULT_GRID_MM))
+    }
+
     /// Commit one wall segment. Both click-click and press-drag use this path.
     fn commit_wall(&mut self, start: Pt, end: Pt) {
         if !is_valid_wall(start, end) {
             return;
         }
         let id = EntityId(self.doc.next_id());
-        let wall = Wall::new(
+        let mut wall = Wall::new(
             id,
             start,
             end,
             default_thickness(&self.doc),
             WallKind::Partition,
         );
+        wall.floor = self.floor();
         self.history.execute(
             Box::new(AddWall {
                 wall,
@@ -826,6 +1435,131 @@ impl SceneState {
         self.selection = vec![id];
         let len = ((end.x - start.x) as f64).hypot((end.y - start.y) as f64);
         self.note = Some(format!("墙 {:.2} m", len / 1000.0));
+    }
+
+    fn commit_stair(&mut self, start: Pt, end: Pt) {
+        let len = ((end.x - start.x) as f64).hypot((end.y - start.y) as f64);
+        if len < 500.0 {
+            self.note = Some("楼梯长度至少 0.5 m".into());
+            return;
+        }
+        if self.floor_index() + 1 >= self.doc.level_count() {
+            self.note = Some("顶层不能再放楼梯，请先新增楼层".into());
+            return;
+        }
+        let steps = ((len / 250.0).round() as u32).clamp(8, 20);
+        let stair = Stair {
+            id: EntityId(self.doc.next_id()),
+            floor: self.floor(),
+            start,
+            end,
+            width_mm: 1000,
+            steps,
+        };
+        self.history
+            .execute(Box::new(AddStair { stair }), &mut self.doc);
+        self.note = Some(format!("楼梯 {:.2} m · {} 级", len / 1000.0, steps));
+        self.touch();
+    }
+
+    pub fn active_level_info(&self) -> (String, i32) {
+        let index = self.floor_index();
+        let level = self.doc.levels.get(index);
+        (
+            level
+                .map(|l| l.name.clone())
+                .unwrap_or_else(|| format!("{}F", index + 1)),
+            level.map(|l| l.height_mm).unwrap_or(2800),
+        )
+    }
+
+    pub fn set_active_level_info(&mut self, name: &str, height_mm: i32) -> Result<(), String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("楼层名称不能为空".into());
+        }
+        if trimmed.chars().count() > 12 {
+            return Err("楼层名称最多 12 个字符".into());
+        }
+        if !(1_800..=6_000).contains(&height_mm) {
+            return Err("层高需在 1800–6000 mm 之间".into());
+        }
+        let index = self.floor_index();
+        let before = self.doc.clone();
+        let mut after = before.clone();
+        if index >= after.levels.len() {
+            after.ensure_levels();
+        }
+        let level = &mut after.levels[index];
+        if level.name == trimmed && level.height_mm == height_mm {
+            return Ok(());
+        }
+        level.name = trimmed.to_string();
+        level.height_mm = height_mm;
+        self.history.execute(
+            Box::new(LevelSnapshot {
+                before,
+                after,
+                label: "edit level",
+            }),
+            &mut self.doc,
+        );
+        self.note = Some(format!("{trimmed} · 层高 {height_mm} mm"));
+        let elevation = self.doc.level_elevation_mm(index) as f32 / 1000.0;
+        self.cam3.target.y = elevation + 1.2;
+        self.walk.pos.y = elevation + EYE_HEIGHT;
+        self.touch();
+        Ok(())
+    }
+
+    pub fn selected_stair_info(&self) -> Option<Stair> {
+        let id = self.selected_stair?;
+        self.doc.stairs.iter().find(|s| s.id == id).cloned()
+    }
+
+    pub fn set_selected_stair_size(
+        &mut self,
+        width_mm: Option<i32>,
+        steps: Option<u32>,
+    ) -> Result<(), String> {
+        let before = self.selected_stair_info().ok_or("未选中楼梯")?;
+        let mut after = before.clone();
+        if let Some(width) = width_mm {
+            if !(600..=2_000).contains(&width) {
+                return Err("楼梯宽度需在 600–2000 mm 之间".into());
+            }
+            after.width_mm = width;
+        }
+        if let Some(count) = steps {
+            if !(3..=40).contains(&count) {
+                return Err("踏步数需在 3–40 级之间".into());
+            }
+            after.steps = count;
+        }
+        if before.width_mm == after.width_mm && before.steps == after.steps {
+            return Ok(());
+        }
+        let width = after.width_mm;
+        let steps = after.steps;
+        self.history
+            .execute(Box::new(UpdateStair { before, after }), &mut self.doc);
+        self.note = Some(format!("楼梯已更新 · {width} mm · {steps} 级"));
+        self.touch();
+        Ok(())
+    }
+
+    pub fn reverse_selected_stair(&mut self) -> bool {
+        let Some(before) = self.selected_stair_info() else {
+            return false;
+        };
+        let mut after = before.clone();
+        after.start = before.end;
+        after.end = before.start;
+        self.history
+            .execute(Box::new(UpdateStair { before, after }), &mut self.doc);
+        self.note = Some("楼梯方向已反向".into());
+        self.touch();
+        true
     }
 
     /// Finalise a piece that is still under the pointer. Called on release,
@@ -859,14 +1593,14 @@ impl SceneState {
     fn furniture_clear_against(&self, item: &Furniture, center: Pt, others: &[Furniture]) -> bool {
         let mut probe = item.clone();
         probe.center = center;
-        furniture_blocking_wall(&probe, &self.doc.walls).is_none()
+        furniture_blocking_wall(&probe, &self.walls_for_floor(self.floor())).is_none()
             && furniture_blocking_other(&probe, others, &[]).is_none()
     }
 
     /// Pick the requested centre when clear, otherwise nudge the piece along a
     /// small ring until it fits. Returns `None` when there is no nearby space.
     fn clear_placement_center(&self, item: &Furniture, desired: Pt) -> Option<Pt> {
-        self.clear_center_against(item, desired, &self.doc.furniture)
+        self.clear_center_against(item, desired, &self.furniture_for_floor(self.floor()))
     }
 
     fn clear_center_against(
@@ -901,10 +1635,12 @@ impl SceneState {
 
     /// Measurements live in the document so they survive save/load and undo.
     fn sync_measurements(&mut self) {
+        let floor = self.floor();
         self.measurements = self
             .doc
             .measures
             .iter()
+            .filter(|m| m.floor == floor)
             .map(|m| Measurement { from: m.a, to: m.b })
             .collect();
     }
@@ -997,6 +1733,7 @@ impl SceneState {
                             id: EntityId(self.doc.next_id()),
                             a: from,
                             b: to,
+                            floor: self.active_level as u32,
                         };
                         self.history
                             .execute(Box::new(AddMeasure { measure }), &mut self.doc);
@@ -1023,6 +1760,7 @@ impl SceneState {
                 snap_to_grid(world.y, DEFAULT_GRID_MM),
             );
             let mut item = Furniture::from_spec(EntityId(self.doc.next_id()), spec, desired, 0.0);
+            item.floor = self.floor();
             let Some(center) = self.clear_placement_center(&item, desired) else {
                 self.note = Some("此处没有足够空间放置家具".into());
                 self.touch();
@@ -1057,7 +1795,8 @@ impl SceneState {
         }
 
         if matches!(self.tool, Tool::Door | Tool::Window) {
-            if let Some(wall_id) = hit_wall(&self.doc.walls, &self.cam, pos, 6.0) {
+            let floor_walls = self.walls_for_floor(self.floor());
+            if let Some(wall_id) = hit_wall(&floor_walls, &self.cam, pos, 6.0) {
                 let wall = self.doc.walls.iter().find(|w| w.id == wall_id).cloned();
                 if let Some(wall) = wall {
                     let width = opening_width(self.tool);
@@ -1092,6 +1831,7 @@ impl SceneState {
                                 sill_mm: if kind == OpeningKind::Door { 0 } else { 900 },
                                 swing_deg: 90.0,
                                 hinge_right: false,
+                                price: None,
                             };
                             self.history
                                 .execute(Box::new(AddOpening { opening }), &mut self.doc);
@@ -1103,16 +1843,36 @@ impl SceneState {
             return;
         }
 
-        if self.tool == Tool::Wall {
+        if self.tool == Tool::Stair {
             let world = self.pointer_world();
             match self.draft {
                 None => {
                     self.draft = Some(world);
                     self.wall_pressed = true;
-                    self.note = Some("拖到终点松手，或再点一下确定".into());
+                    self.note = Some("拖到楼梯终点松手，或再点一下确定".into());
                 }
                 Some(start) => {
                     let end = constrained_end(start, world, true, DEFAULT_GRID_MM);
+                    self.commit_stair(start, end);
+                    self.draft = None;
+                    self.wall_pressed = false;
+                }
+            }
+            self.touch();
+            return;
+        }
+
+        if self.tool == Tool::Wall {
+            let raw = self.pointer_world();
+            match self.draft {
+                None => {
+                    let start = self.snap_wall_start(raw);
+                    self.draft = Some(start);
+                    self.wall_pressed = true;
+                    self.note = Some("拖到终点松手，或再点一下确定".into());
+                }
+                Some(start) => {
+                    let end = self.snap_wall_end(start, raw);
                     self.commit_wall(start, end);
                     self.draft = None;
                     self.wall_pressed = false;
@@ -1123,7 +1883,8 @@ impl SceneState {
         }
 
         if self.tool == Tool::Demolish {
-            if let Some((wall_id, wall_kind)) = hit_wall(&self.doc.walls, &self.cam, pos, 8.0)
+            let floor_walls = self.walls_for_floor(self.floor());
+            if let Some((wall_id, wall_kind)) = hit_wall(&floor_walls, &self.cam, pos, 8.0)
                 .and_then(|id| {
                     self.doc
                         .walls
@@ -1169,6 +1930,7 @@ impl SceneState {
                 self.selected_room = None;
                 self.selected_furniture = None;
                 self.furniture_selection.clear();
+                self.selected_stair = None;
             }
             self.selected_opening = Some(oid);
             let grabbed = self
@@ -1200,7 +1962,8 @@ impl SceneState {
             return;
         }
 
-        let hit = hit_wall(&self.doc.walls, &self.cam, pos, 6.0);
+        let floor_walls = self.walls_for_floor(self.floor());
+        let hit = hit_wall(&floor_walls, &self.cam, pos, 6.0);
         match hit {
             Some(id) => {
                 if shift {
@@ -1217,8 +1980,10 @@ impl SceneState {
                     self.selected_furniture = None;
                     self.furniture_selection.clear();
                     self.selected_opening = None;
+                    self.selected_stair = None;
                 }
-                self.drag = DragSession::begin(&self.doc.walls, &self.selection, pos);
+                self.drag =
+                    DragSession::begin(&self.walls_for_floor(self.floor()), &self.selection, pos);
             }
             None => {
                 let world = self.pointer_world();
@@ -1227,21 +1992,32 @@ impl SceneState {
                     .furniture
                     .iter()
                     .rev()
-                    .find(|f| furniture_hit(f, world))
+                    .find(|f| f.floor == self.floor() && furniture_hit(f, world))
                     .map(|f| (f.id, f.center));
-                let room = if shift || furn.is_some() {
+                let stair = if shift || furn.is_some() {
+                    None
+                } else {
+                    self.doc
+                        .stairs
+                        .iter()
+                        .rev()
+                        .find(|s| s.floor == self.floor() && point_in_stair(s, world, 8.0))
+                        .map(|s| s.id)
+                };
+                let room = if shift || furn.is_some() || stair.is_some() {
                     None
                 } else {
                     self.doc
                         .rooms
                         .iter()
-                        .find(|r| point_in_polygon(world, &r.polygon))
+                        .find(|r| r.floor == self.floor() && point_in_polygon(world, &r.polygon))
                         .map(|r| r.id)
                 };
                 if !shift {
                     self.selection.clear();
                     self.selected_room = None;
                     self.selected_opening = None;
+                    self.selected_stair = None;
                 }
                 if let Some((fid, _)) = furn {
                     if shift {
@@ -1261,6 +2037,7 @@ impl SceneState {
                             self.furniture_selection = vec![fid];
                         }
                         self.selected_furniture = Some(fid);
+                        self.selected_stair = None;
                         let before = self
                             .furniture_selection
                             .iter()
@@ -1282,8 +2059,16 @@ impl SceneState {
                         self.box_select = None;
                         self.drag = None;
                     }
+                } else if let Some(stair_id) = stair {
+                    self.selected_stair = Some(stair_id);
+                    self.selected_room = None;
+                    self.selected_furniture = None;
+                    self.furniture_selection.clear();
+                    self.box_select = None;
+                    self.drag = None;
                 } else if let Some(room_id) = room {
                     self.selected_room = Some(room_id);
+                    self.selected_stair = None;
                     if !shift {
                         self.selected_furniture = None;
                         self.furniture_selection.clear();
@@ -1325,13 +2110,18 @@ impl SceneState {
                     {
                         let mut probe = item.clone();
                         probe.center = centre;
-                        if blocked_along_move(&probe, item.center, centre, &self.doc.walls)
-                            .is_some()
+                        if blocked_along_move(
+                            &probe,
+                            item.center,
+                            centre,
+                            &self.walls_for_floor(self.floor()),
+                        )
+                        .is_some()
                             || furniture_path_blocked(
                                 &probe,
                                 item.center,
                                 centre,
-                                &self.doc.furniture,
+                                &self.furniture_for_floor(self.floor()),
                                 &[drag.id],
                             )
                             .is_some()
@@ -1377,12 +2167,18 @@ impl SceneState {
             else {
                 return;
             };
-            if blocked_along_move(&probe, probe.center, centre, &self.doc.walls).is_some()
+            if blocked_along_move(
+                &probe,
+                probe.center,
+                centre,
+                &self.walls_for_floor(self.floor()),
+            )
+            .is_some()
                 || furniture_path_blocked(
                     &probe,
                     probe.center,
                     centre,
-                    &self.doc.furniture,
+                    &self.furniture_for_floor(self.floor()),
                     &[place.id],
                 )
                 .is_some()
@@ -1419,7 +2215,9 @@ impl SceneState {
                     };
                     let mut probe = base;
                     probe.rotation_deg = rotation;
-                    if furniture_blocking_wall(&probe, &self.doc.walls).is_some() {
+                    if furniture_blocking_wall(&probe, &self.walls_for_floor(self.floor()))
+                        .is_some()
+                    {
                         self.note_wall_blocked();
                         return;
                     }
@@ -1514,9 +2312,16 @@ impl SceneState {
                     continue;
                 };
                 let target = Pt::new(before.x + dx, before.y + dy);
-                if blocked_along_move(base, *before, target, &self.doc.walls).is_some()
-                    || furniture_path_blocked(base, *before, target, &self.doc.furniture, &moving)
-                        .is_some()
+                if blocked_along_move(base, *before, target, &self.walls_for_floor(self.floor()))
+                    .is_some()
+                    || furniture_path_blocked(
+                        base,
+                        *before,
+                        target,
+                        &self.furniture_for_floor(self.floor()),
+                        &moving,
+                    )
+                    .is_some()
                 {
                     blocked = true;
                     break;
@@ -1560,7 +2365,10 @@ impl SceneState {
             return;
         }
         let hover = if matches!(self.tool, Tool::Select | Tool::Demolish) {
-            hit_wall(&self.doc.walls, &self.cam, pos, 6.0)
+            {
+                let floor_walls = self.walls_for_floor(self.floor());
+                hit_wall(&floor_walls, &self.cam, pos, 6.0)
+            }
         } else {
             None
         };
@@ -1639,10 +2447,26 @@ impl SceneState {
             return;
         }
 
-        if self.tool == Tool::Wall && self.wall_pressed {
+        if self.tool == Tool::Stair && self.wall_pressed {
             self.wall_pressed = false;
             if let Some(start) = self.draft {
                 let end = constrained_end(start, self.pointer_world(), true, DEFAULT_GRID_MM);
+                let len = ((end.x - start.x) as f64).hypot((end.y - start.y) as f64);
+                if len >= 500.0 {
+                    self.commit_stair(start, end);
+                    self.draft = None;
+                } else {
+                    self.note = Some("再点一下确定楼梯终点".into());
+                }
+                self.touch();
+            }
+            return;
+        }
+
+        if self.tool == Tool::Wall && self.wall_pressed {
+            self.wall_pressed = false;
+            if let Some(start) = self.draft {
+                let end = self.snap_wall_end(start, self.pointer_world());
                 let len = ((end.x - start.x) as f64).hypot((end.y - start.y) as f64);
                 if len >= 50.0 {
                     self.commit_wall(start, end);
@@ -1769,7 +2593,7 @@ impl SceneState {
                 anchor[1].max(pos[1]),
             ];
             if (rect[2] - rect[0]) > 3.0 || (rect[3] - rect[1]) > 3.0 {
-                let picked = walls_in_rect(&self.doc.walls, &self.cam, rect);
+                let picked = walls_in_rect(&self.walls_for_floor(self.floor()), &self.cam, rect);
                 if shift {
                     for id in picked {
                         if !self.selection.contains(&id) {
@@ -1865,14 +2689,22 @@ impl SceneState {
         match key {
             "z" | "Z" if cmd && shift => {
                 if self.history.redo(&mut self.doc) {
+                    self.active_level = self
+                        .active_level
+                        .min(self.doc.level_count().saturating_sub(1));
                     self.prune_selection();
                     self.sync_measurements();
+                    self.touch();
                 }
             }
             "z" | "Z" if cmd => {
                 if self.history.undo(&mut self.doc) {
+                    self.active_level = self
+                        .active_level
+                        .min(self.doc.level_count().saturating_sub(1));
                     self.prune_selection();
                     self.sync_measurements();
+                    self.touch();
                 }
             }
             "s" | "S" if cmd => self.save(),
@@ -1997,8 +2829,9 @@ impl SceneState {
         let mut probe = item.clone();
         probe.width_mm = after.0;
         probe.depth_mm = after.1;
-        if furniture_blocking_wall(&probe, &self.doc.walls).is_some()
-            || furniture_blocking_other(&probe, &self.doc.furniture, &[id]).is_some()
+        if furniture_blocking_wall(&probe, &self.walls_for_floor(self.floor())).is_some()
+            || furniture_blocking_other(&probe, &self.furniture_for_floor(self.floor()), &[id])
+                .is_some()
         {
             self.note_wall_blocked();
             return;
@@ -2026,8 +2859,9 @@ impl SceneState {
         let mut probe = item.clone();
         probe.width_mm = after.0;
         probe.depth_mm = after.1;
-        if furniture_blocking_wall(&probe, &self.doc.walls).is_some()
-            || furniture_blocking_other(&probe, &self.doc.furniture, &[id]).is_some()
+        if furniture_blocking_wall(&probe, &self.walls_for_floor(self.floor())).is_some()
+            || furniture_blocking_other(&probe, &self.furniture_for_floor(self.floor()), &[id])
+                .is_some()
         {
             self.note_wall_blocked();
             return;
@@ -2053,14 +2887,37 @@ impl SceneState {
         }
         let mut probe = item.clone();
         probe.center = after;
-        if furniture_blocking_wall(&probe, &self.doc.walls).is_some()
-            || furniture_blocking_other(&probe, &self.doc.furniture, &[id]).is_some()
+        if furniture_blocking_wall(&probe, &self.walls_for_floor(self.floor())).is_some()
+            || furniture_blocking_other(&probe, &self.furniture_for_floor(self.floor()), &[id])
+                .is_some()
         {
             self.note_wall_blocked();
             return;
         }
         self.history
             .execute(Box::new(MoveFurniture { id, before, after }), &mut self.doc);
+    }
+
+    fn set_furniture_price(&mut self, price: i32) {
+        let Some(id) = self.selected_furniture else {
+            return;
+        };
+        let Some(item) = self.doc.furniture.iter().find(|f| f.id == id) else {
+            return;
+        };
+        let after = Some(price.clamp(0, 1_000_000) as f64);
+        if item.price == after {
+            return;
+        }
+        self.history.execute(
+            Box::new(SetFurniturePrice {
+                id,
+                before: item.price,
+                after,
+            }),
+            &mut self.doc,
+        );
+        self.note = Some(format!("家具单价改为 ¥{price}"));
     }
 
     fn set_furniture_color(&mut self, hex: &'static str) {
@@ -2119,7 +2976,7 @@ impl SceneState {
         let after = (before + delta_deg).rem_euclid(360.0);
         let mut probe = item.clone();
         probe.rotation_deg = after;
-        if furniture_blocking_wall(&probe, &self.doc.walls).is_some() {
+        if furniture_blocking_wall(&probe, &self.walls_for_floor(self.floor())).is_some() {
             self.note_wall_blocked();
             return;
         }
@@ -2257,7 +3114,14 @@ impl SceneState {
             };
             let mut probe = base.clone();
             probe.center = mv.after;
-            if blocked_along_move(&probe, mv.before, mv.after, &self.doc.walls).is_some() {
+            if blocked_along_move(
+                &probe,
+                mv.before,
+                mv.after,
+                &self.walls_for_floor(self.floor()),
+            )
+            .is_some()
+            {
                 self.note_wall_blocked();
                 return;
             }
@@ -2310,6 +3174,35 @@ impl SceneState {
         result
     }
 
+    pub fn quote_settings(&self) -> QuoteSettings {
+        self.doc.quote.clone()
+    }
+
+    /// Update labour/auxiliary/tax/discount rates. Values are already in yuan
+    /// per m² and fractions (0.09 = 9%); the UI parses percentages before this.
+    pub fn update_quote_settings(
+        &mut self,
+        labor_per_m2: f64,
+        auxiliary_per_m2: f64,
+        tax_rate: f64,
+        discount_rate: f64,
+    ) {
+        let after = QuoteSettings {
+            labor_per_m2: labor_per_m2.clamp(0.0, 10_000.0),
+            auxiliary_per_m2: auxiliary_per_m2.clamp(0.0, 10_000.0),
+            tax_rate: tax_rate.clamp(0.0, 0.5),
+            discount_rate: discount_rate.clamp(0.0, 0.5),
+        };
+        if self.doc.quote == after {
+            return;
+        }
+        let before = self.doc.quote.clone();
+        self.history
+            .execute(Box::new(SetQuoteSettings { before, after }), &mut self.doc);
+        self.note = Some("报价费率已更新".into());
+        self.touch();
+    }
+
     fn flip_opening_swing(&mut self) {
         let Some(id) = self.selected_opening else {
             return;
@@ -2350,19 +3243,26 @@ impl SceneState {
         let Some(room_id) = self.selected_room else {
             return;
         };
-        if self.doc.materials.is_empty() {
+        let floor_ids: Vec<EntityId> = self
+            .doc
+            .materials
+            .iter()
+            .filter(|m| m.surface == FinishSurface::Floor)
+            .map(|m| m.id)
+            .collect();
+        if floor_ids.is_empty() {
             return;
         }
         let Some(room) = self.doc.rooms.iter().find(|r| r.id == room_id) else {
             return;
         };
         let before = room.material_id;
-        let current = before.and_then(|id| self.doc.materials.iter().position(|m| m.id == id));
+        let current = before.and_then(|id| floor_ids.iter().position(|x| *x == id));
         let next = match current {
-            Some(i) => (i + 1) % self.doc.materials.len(),
+            Some(i) => (i + 1) % floor_ids.len(),
             None => 0,
         };
-        let after = Some(self.doc.materials[next].id);
+        let after = Some(floor_ids[next]);
         if before == after {
             return;
         }
@@ -2377,6 +3277,123 @@ impl SceneState {
     }
 
     /// Choose a specific flooring swatch, undoable like the cycle shortcut.
+    /// Add a blank custom material and return its id.
+    pub fn add_material(&mut self) -> EntityId {
+        let before = self.doc.materials.clone();
+        let id = EntityId(self.doc.next_id());
+        let mut after = before.clone();
+        after.push(Material {
+            id,
+            name: "新材料".into(),
+            price_per_m2: 0.0,
+            kind: "wood".into(),
+            color: "#c49a6c".into(),
+            surface: fp_model::FinishSurface::Floor,
+            waste_rate: fp_model::default_waste_rate(),
+            built_in: false,
+        });
+        self.history.execute(
+            Box::new(MaterialSnapshot {
+                before,
+                after,
+                label: "add material",
+            }),
+            &mut self.doc,
+        );
+        self.note = Some("已新增材料，可修改名称、单价和纹理".into());
+        self.touch();
+        id
+    }
+
+    /// Replace one material. The id is kept; rooms referencing it update
+    /// automatically because they store only the id.
+    pub fn update_material(&mut self, after: Material) {
+        let Some(index) = self.doc.materials.iter().position(|m| m.id == after.id) else {
+            return;
+        };
+        if self.doc.materials[index] == after {
+            return;
+        }
+        let before = self.doc.materials.clone();
+        let mut next = before.clone();
+        next[index] = after;
+        self.history.execute(
+            Box::new(MaterialSnapshot {
+                before,
+                after: next,
+                label: "edit material",
+            }),
+            &mut self.doc,
+        );
+        self.note = Some("材料已更新".into());
+        self.touch();
+    }
+
+    /// Delete an unused material. The last library entry is protected.
+    pub fn remove_material(&mut self, id: EntityId) {
+        let used = self.material_usage(id);
+        if used > 0 {
+            self.note = Some(format!("该饰面仍被 {used} 处使用，先改对应材质"));
+            return;
+        }
+        if self.doc.materials.len() <= 1 {
+            self.note = Some("至少保留一种材料".into());
+            return;
+        }
+        let before = self.doc.materials.clone();
+        let after: Vec<Material> = before.iter().filter(|m| m.id != id).cloned().collect();
+        self.history.execute(
+            Box::new(MaterialSnapshot {
+                before,
+                after,
+                label: "remove material",
+            }),
+            &mut self.doc,
+        );
+        self.note = Some("材料已删除".into());
+        self.touch();
+    }
+
+    pub fn material_usage(&self, id: EntityId) -> usize {
+        self.material_usage_info(id).0
+    }
+
+    /// Count and surface area for one finish, across floors, walls and
+    /// ceilings. The biller adds the material's own waste rate on top.
+    pub fn material_usage_info(&self, id: EntityId) -> (usize, f64) {
+        let mut count = 0usize;
+        let mut area = 0.0f64;
+        for room in self.doc.rooms.iter().filter(|r| r.material_id == Some(id)) {
+            count += 1;
+            area += fp_geom::area(&room.polygon) / 1_000_000.0;
+        }
+        for room in self
+            .doc
+            .rooms
+            .iter()
+            .filter(|r| r.ceiling_material_id == Some(id))
+        {
+            count += 1;
+            area += fp_geom::area(&room.polygon) / 1_000_000.0;
+        }
+        for wall in self
+            .doc
+            .walls
+            .iter()
+            .filter(|w| w.finish_id == Some(id))
+        {
+            count += 1;
+            let length_mm =
+                ((wall.end.x - wall.start.x) as f64).hypot((wall.end.y - wall.start.y) as f64);
+            area += length_mm / 1000.0 * wall.height_mm as f64 / 1000.0;
+        }
+        (count, area)
+    }
+
+    pub fn material(&self, id: EntityId) -> Option<&Material> {
+        self.doc.materials.iter().find(|m| m.id == id)
+    }
+
     pub fn set_room_material(&mut self, material: EntityId) {
         let Some(room_id) = self.selected_room else {
             return;
@@ -2384,7 +3401,12 @@ impl SceneState {
         let Some(room) = self.doc.rooms.iter().find(|r| r.id == room_id) else {
             return;
         };
-        if !self.doc.materials.iter().any(|m| m.id == material) {
+        if !self
+            .doc
+            .materials
+            .iter()
+            .any(|m| m.id == material && m.surface == FinishSurface::Floor)
+        {
             return;
         }
         let before = room.material_id;
@@ -2452,6 +3474,7 @@ impl SceneState {
             remap.insert(wall.id, id);
             let mut copy = wall.clone();
             copy.id = id;
+            copy.floor = self.floor();
             copy.start = Pt::new(wall.start.x + offset.x, wall.start.y + offset.y);
             copy.end = Pt::new(wall.end.x + offset.x, wall.end.y + offset.y);
             walls.push(copy);
@@ -2461,6 +3484,7 @@ impl SceneState {
         for item in &clip.furniture {
             let mut copy = item.clone();
             copy.id = fresh();
+            copy.floor = self.floor();
             let desired = Pt::new(item.center.x + offset.x, item.center.y + offset.y);
             // A paste must never be born stacked on top of another piece or
             // inside a wall. Nudge the copy to the nearest clear spot.
@@ -2480,7 +3504,11 @@ impl SceneState {
                 .copied()
                 .unwrap_or(opening.wall_id);
             let wall_exists = walls.iter().any(|w| w.id == wall_id)
-                || self.doc.walls.iter().any(|w| w.id == wall_id);
+                || self
+                    .doc
+                    .walls
+                    .iter()
+                    .any(|w| w.id == wall_id && w.floor == self.floor());
             if !wall_exists {
                 continue;
             }
@@ -2528,6 +3556,14 @@ impl SceneState {
                     .execute(Box::new(RemoveFurnitureBatch { items }), &mut self.doc);
                 self.selected_furniture = None;
                 self.furniture_selection.clear();
+                self.touch();
+                return;
+            }
+        }
+        if let Some(sid) = self.selected_stair.take() {
+            if let Some(stair) = self.doc.stairs.iter().find(|s| s.id == sid).cloned() {
+                self.history
+                    .execute(Box::new(RemoveStair { stair }), &mut self.doc);
                 self.touch();
                 return;
             }
@@ -2889,9 +3925,11 @@ impl SceneState {
         let look = if self.night {
             crate::render3d::Look {
                 light: [light[0] * 0.55, -0.55, light[2] * 0.55],
-                ambient: 0.10,
-                diffuse: 0.34,
+                ambient: 0.055,
+                diffuse: 0.19,
                 tint: [0.52, 0.60, 0.95],
+                exposure: 0.72,
+                ssao: 0.30,
                 clear: [0.015, 0.020, 0.048],
                 lamps,
                 lamp_count: lamp_count as f32,
@@ -2900,9 +3938,11 @@ impl SceneState {
         } else {
             crate::render3d::Look {
                 light,
-                ambient: 0.55 + 0.50 * arc,
-                diffuse: 0.55 + 0.45 * arc,
+                ambient: 0.50 + 0.18 * arc,
+                diffuse: 0.25 + 0.24 * arc,
                 tint: [1.0, 0.84 + 0.14 * arc, 0.70 + 0.27 * arc],
+                exposure: 0.76,
+                ssao: 0.40,
                 // Match the plan sheet's warm paper background instead of
                 // dropping the whole window into a dark "night" look.
                 clear: [0.965, 0.957, 0.941],
@@ -3199,19 +4239,41 @@ impl SceneState {
         let parts = self.mesh3d_with(false);
         let mut mesh = parts.vertices;
         let opaque = parts.opaque;
+        let mut ceilings = Vec::new();
+        let top_level = self.doc.level_count().saturating_sub(1);
+        for level in 0..self.doc.level_count() {
+            if self.show_roof && level == top_level {
+                continue;
+            }
+            let floor = level as u32;
+            let elevation = self.doc.level_elevation_mm(level) as f32 / 1000.0;
+            let rooms: Vec<Room> = self
+                .doc
+                .rooms
+                .iter()
+                .filter(|r| r.floor == floor)
+                .cloned()
+                .collect();
+            let mut part = ceiling_mesh_with_materials(&rooms, CEILING_HEIGHT, &self.doc.materials);
+            for vertex in &mut part {
+                vertex.pos[1] += elevation;
+            }
+            ceilings.extend(part);
+        }
+        let ceiling_len = ceilings.len();
         if opaque < mesh.len() {
             let glass = mesh.split_off(opaque);
-            mesh.extend(ceiling_mesh(&self.doc.rooms, CEILING_HEIGHT));
+            mesh.extend(ceilings);
             mesh.extend(glass);
             fp_render3d::MeshParts {
                 vertices: mesh,
-                opaque,
+                opaque: opaque + ceiling_len,
             }
         } else {
-            mesh.extend(ceiling_mesh(&self.doc.rooms, CEILING_HEIGHT));
+            mesh.extend(ceilings);
             fp_render3d::MeshParts {
                 vertices: mesh,
-                opaque,
+                opaque: opaque + ceiling_len,
             }
         }
     }
@@ -3230,79 +4292,116 @@ impl SceneState {
 
     fn mesh3d_with(&self, cutaway: bool) -> fp_render3d::MeshParts {
         const CUT_MM: i32 = 1350;
-        let walls: Vec<Wall> = if cutaway {
-            self.doc
-                .walls
-                .iter()
-                .map(|w| {
-                    let mut copy = w.clone();
-                    copy.height_mm = copy.height_mm.min(CUT_MM);
-                    copy
-                })
-                .collect()
-        } else {
-            self.doc.walls.clone()
-        };
-        let openings: Vec<Opening> = if cutaway {
-            self.doc
-                .openings
-                .iter()
-                .map(|o| {
-                    let mut copy = o.clone();
-                    copy.sill_mm = copy.sill_mm.min(CUT_MM);
-                    copy.height_mm = copy.height_mm.min((CUT_MM - copy.sill_mm).max(0));
-                    copy
-                })
-                .collect()
-        } else {
-            self.doc.openings.clone()
-        };
+        let levels = self.doc.level_count();
         let mut scene = fp_render3d::MeshParts::new();
         scene.push_opaque(fp_render3d::ground_mesh());
-        for wall in &walls {
-            let mut part = wall_mesh_with_openings(std::slice::from_ref(wall), &openings);
-            if self.selection.contains(&wall.id) {
-                paint(&mut part, HIGHLIGHT_3D);
-            }
-            scene.push_opaque(part);
-        }
-        for room in &self.doc.rooms {
-            let mut part = floor_mesh(std::slice::from_ref(room), &self.doc.materials);
-            if self.selected_room == Some(room.id) {
-                paint(&mut part, HIGHLIGHT_3D);
-            }
-            scene.push_opaque(part);
-        }
-        if !cutaway {
-            for opening in &self.doc.openings {
-                if opening.kind != OpeningKind::Door {
-                    continue;
+        for level in 0..levels {
+            let floor = level as u32;
+            let elevation = self.doc.level_elevation_mm(level) as f32 / 1000.0;
+            let walls: Vec<Wall> = self
+                .doc
+                .walls
+                .iter()
+                .filter(|w| w.floor == floor)
+                .map(|w| {
+                    let mut copy = w.clone();
+                    if cutaway {
+                        copy.height_mm = copy.height_mm.min(CUT_MM);
+                    }
+                    copy
+                })
+                .collect();
+            let openings: Vec<Opening> = self
+                .doc
+                .openings
+                .iter()
+                .filter(|o| walls.iter().any(|w| w.id == o.wall_id))
+                .map(|o| {
+                    let mut copy = o.clone();
+                    if cutaway {
+                        copy.sill_mm = copy.sill_mm.min(CUT_MM);
+                        copy.height_mm = copy.height_mm.min((CUT_MM - copy.sill_mm).max(0));
+                    }
+                    copy
+                })
+                .collect();
+
+            let mut floor_parts = fp_render3d::MeshParts::new();
+            for wall in &walls {
+                let mut part = wall_mesh_with_finishes(
+                    std::slice::from_ref(wall),
+                    &openings,
+                    &self.doc.materials,
+                );
+                if self.selection.contains(&wall.id) {
+                    paint(&mut part, HIGHLIGHT_3D);
                 }
-                let Some(wall) = self.doc.walls.iter().find(|w| w.id == opening.wall_id) else {
-                    continue;
-                };
-                let swing = if self.doors_open.contains(&opening.id.0) {
-                    if opening.swing_deg < 0.0 { -78.0 } else { 78.0 }
-                } else {
-                    0.0
-                };
-                scene.push_opaque(fp_render3d::door_leaf_mesh(wall, opening, swing));
+                floor_parts.push_opaque(part);
             }
+            for room in self.doc.rooms.iter().filter(|r| r.floor == floor) {
+                let mut part = floor_mesh(std::slice::from_ref(room), &self.doc.materials);
+                if self.selected_room == Some(room.id) {
+                    paint(&mut part, HIGHLIGHT_3D);
+                }
+                floor_parts.push_opaque(part);
+            }
+            if !cutaway {
+                for opening in &openings {
+                    if opening.kind != OpeningKind::Door {
+                        continue;
+                    }
+                    let Some(wall) = walls.iter().find(|w| w.id == opening.wall_id) else {
+                        continue;
+                    };
+                    let swing = if self.doors_open.contains(&opening.id.0) {
+                        if opening.swing_deg < 0.0 { -78.0 } else { 78.0 }
+                    } else {
+                        0.0
+                    };
+                    floor_parts.push_opaque(fp_render3d::door_leaf_mesh(wall, opening, swing));
+                }
+            }
+            if self.doc.settings.show_furniture {
+                for item in self.doc.furniture.iter().filter(|f| f.floor == floor) {
+                    let mut parts = fp_render3d::furniture_mesh_parts(std::slice::from_ref(item));
+                    if self.furniture_selection.contains(&item.id) {
+                        paint(&mut parts.vertices, HIGHLIGHT_3D);
+                    }
+                    floor_parts.push_mixed(parts);
+                }
+            }
+            if !cutaway {
+                floor_parts.push_glass(fp_render3d::opening_glass_mesh(&walls, &openings));
+            }
+            for stair in self.doc.stairs.iter().filter(|s| s.floor == floor) {
+                floor_parts.push_opaque(fp_render3d::stair_mesh(
+                    stair,
+                    self.doc.level_height_mm(level) as f32 / 1000.0,
+                ));
+            }
+            for vertex in &mut floor_parts.vertices {
+                vertex.pos[1] += elevation;
+            }
+            scene.push_mixed(floor_parts);
         }
-        for item in &self.doc.furniture {
-            if !self.doc.settings.show_furniture {
-                break;
-            }
-            let mut parts = fp_render3d::furniture_mesh_parts(std::slice::from_ref(item));
-            if self.furniture_selection.contains(&item.id) {
-                paint(&mut parts.vertices, HIGHLIGHT_3D);
-            }
-            scene.push_mixed(parts);
-        }
-        if !cutaway {
-            scene.push_glass(fp_render3d::opening_glass_mesh(
-                &self.doc.walls,
-                &self.doc.openings,
+        if self.show_roof && levels > 0 {
+            let top = levels - 1;
+            let roof_height =
+                (self.doc.level_elevation_mm(top) + self.doc.level_height_mm(top)) as f32 / 1000.0;
+            let rooms: Vec<Room> = self
+                .doc
+                .rooms
+                .iter()
+                .filter(|r| r.floor == top as u32)
+                .cloned()
+                .collect();
+            let roof = self.doc.roof.normalized();
+            scene.push_opaque(fp_render3d::roof_mesh_for(
+                &rooms,
+                roof_height,
+                roof.kind,
+                roof.pitch_deg,
+                roof.overhang_mm,
             ));
         }
         scene
@@ -3330,7 +4429,13 @@ impl SceneState {
         let Some((origin, dir)) = self.ray_3d(pos) else {
             return false;
         };
-        let Some(Pick3d::Furniture(id)) = pick_scene(&self.doc, origin, dir) else {
+        let Some(Pick3d::Furniture(id)) = pick_scene_at(
+            &self.doc,
+            origin,
+            dir,
+            self.floor(),
+            self.doc.level_elevation_mm(self.floor_index()) as f32 / 1000.0,
+        ) else {
             return false;
         };
         let Some(item) = self.doc.furniture.iter().find(|f| f.id == id) else {
@@ -3360,7 +4465,8 @@ impl SceneState {
         if dir.y.abs() < 1e-4 {
             return None;
         }
-        let t = (0.02 - origin.y) / dir.y;
+        let elevation = self.doc.level_elevation_mm(self.floor_index()) as f32 / 1000.0;
+        let t = (elevation + 0.02 - origin.y) / dir.y;
         if t <= 0.0 {
             return None;
         }
@@ -3372,7 +4478,13 @@ impl SceneState {
         let Some((near, dir)) = self.ray_3d(screen) else {
             return;
         };
-        let Some(hit) = pick_scene(&self.doc, near, dir) else {
+        let Some(hit) = pick_scene_at(
+            &self.doc,
+            near,
+            dir,
+            self.floor(),
+            self.doc.level_elevation_mm(self.floor_index()) as f32 / 1000.0,
+        ) else {
             self.note = Some("没点到东西".to_string());
             return;
         };
@@ -3494,20 +4606,24 @@ impl SceneState {
         self.doc = doc;
         self.underlay_image = underlay_image;
         self.history = History::new(200);
+        self.active_level = 0;
         self.selection.clear();
         self.selected_room = None;
         self.selected_furniture = None;
         self.furniture_selection.clear();
         self.selected_opening = None;
+        self.selected_stair = None;
         self.furniture_drag = None;
         self.opening_drag = None;
         self.furniture_drag_3d = None;
         self.rotate_drag = None;
         self.measure_from = None;
+        let floor = self.floor();
         self.measurements = self
             .doc
             .measures
             .iter()
+            .filter(|m| m.floor == floor)
             .map(|m| Measurement { from: m.a, to: m.b })
             .collect();
         self.doors_open.clear();
@@ -3579,10 +4695,98 @@ impl SceneState {
 
     // ---------------------------------------------------------------- status
 
+    /// Stable identity of the current selection. The desktop shell uses it to
+    /// tell "the user selected something new" from "the same panel was closed",
+    /// so a closed inspector reopens on the next selection instead of staying
+    /// silently hidden.
+    pub fn selection_signature(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for id in &self.selection {
+            id.0.hash(&mut hasher);
+        }
+        self.selected_opening.map(|id| id.0).hash(&mut hasher);
+        self.selected_room.map(|id| id.0).hash(&mut hasher);
+        self.selected_furniture.map(|id| id.0).hash(&mut hasher);
+        self.selected_stair.map(|id| id.0).hash(&mut hasher);
+        for id in &self.furniture_selection {
+            id.0.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
     /// Description of the current selection, rendered as the side panel.
     #[allow(clippy::collapsible_if)]
     pub fn inspector(&self) -> Option<InspectorView> {
         let t = crate::i18n::T(self.lang);
+        if let Some(stair) = self.selected_stair_info() {
+            let floor_height = self.doc.level_height_mm(stair.floor as usize) as f64;
+            let run =
+                ((stair.end.x - stair.start.x) as f64).hypot((stair.end.y - stair.start.y) as f64);
+            let rise = if stair.steps > 0 {
+                floor_height / stair.steps as f64
+            } else {
+                0.0
+            };
+            let tread = if stair.steps > 1 {
+                run / stair.steps as f64
+            } else {
+                0.0
+            };
+            return Some(InspectorView {
+                title: t.s("楼梯", "Stair").into(),
+                subtitle: format!(
+                    "{} · {:.2} m",
+                    self.doc.level_name(stair.floor as usize),
+                    run / 1000.0
+                ),
+                kind: InspectorKind::Stair,
+                fields: vec![
+                    InspectorField {
+                        group: t.s("尺寸", "Size").into(),
+                        label: t.s("宽度", "Width").into(),
+                        value: stair.width_mm.to_string(),
+                        unit: "mm".into(),
+                        edit: Some(InspectorEdit::StairWidth),
+                    },
+                    InspectorField {
+                        group: t.s("尺寸", "Size").into(),
+                        label: t.s("踏步数", "Steps").into(),
+                        value: stair.steps.to_string(),
+                        unit: t.s("级", "steps").into(),
+                        edit: Some(InspectorEdit::StairSteps),
+                    },
+                ],
+                rotation: None,
+                swatches: Vec::new(),
+                lines: vec![
+                    t.f(
+                        &format!("总长 {:.2} m", run / 1000.0),
+                        &format!("Run {:.2} m", run / 1000.0),
+                    ),
+                    t.f(
+                        &format!("踏步高 {:.0} mm", rise),
+                        &format!("Rise {:.0} mm", rise),
+                    ),
+                    t.f(
+                        &format!("踏面 {:.0} mm", tread),
+                        &format!("Tread {:.0} mm", tread),
+                    ),
+                    t.f(
+                        &format!("{} 级 · 宽 {} mm", stair.steps, stair.width_mm),
+                        &format!("{} steps · {} mm", stair.steps, stair.width_mm),
+                    ),
+                ],
+                actions: vec![
+                    (t.s("反向", "Reverse"), InspectorAction::StairReverse),
+                    (t.s("删除", "Delete"), InspectorAction::RemoveStair),
+                ],
+                material_options: Vec::new(),
+                wall_finish_options: Vec::new(),
+                ceiling_options: Vec::new(),
+                wall_kind: None,
+                wall_finish: None,
+            });
+        }
         if let Some(id) = self.selected_opening {
             if let Some(o) = self.doc.openings.iter().find(|o| o.id == id) {
                 let door = o.kind == OpeningKind::Door;
@@ -3649,6 +4853,13 @@ impl SceneState {
                         edit: Some(InspectorEdit::OpeningSill),
                     });
                 }
+                fields.push(InspectorField {
+                    group: t.s("造价", "Cost").into(),
+                    label: t.s("单价", "Price").into(),
+                    value: format!("{:.0}", o.effective_price()),
+                    unit: "¥".into(),
+                    edit: Some(InspectorEdit::OpeningPrice),
+                });
                 return Some(InspectorView {
                     title: if door {
                         t.s("门", "Door")
@@ -3671,7 +4882,10 @@ impl SceneState {
                     lines,
                     actions,
                     material_options: Vec::new(),
+                    wall_finish_options: Vec::new(),
+                    ceiling_options: Vec::new(),
                     wall_kind: None,
+                    wall_finish: None,
                 });
             }
         }
@@ -3694,7 +4908,10 @@ impl SceneState {
                     "Shift-click to add/remove · group drag on",
                 )],
                 material_options: Vec::new(),
+                wall_finish_options: Vec::new(),
+                ceiling_options: Vec::new(),
                 wall_kind: None,
+                wall_finish: None,
                 actions: vec![
                     (
                         t.s("左对齐", "Align left"),
@@ -3762,6 +4979,13 @@ impl SceneState {
                         unit: "mm".into(),
                         edit: Some(InspectorEdit::FurnitureY),
                     },
+                    InspectorField {
+                        group: t.s("造价", "Cost").into(),
+                        label: t.s("单价", "Price").into(),
+                        value: format!("{:.0}", f.effective_price()),
+                        unit: "¥".into(),
+                        edit: Some(InspectorEdit::FurniturePrice),
+                    },
                 ];
                 let swatches = FABRIC_SWATCHES
                     .iter()
@@ -3784,7 +5008,10 @@ impl SceneState {
                     swatches,
                     lines: Vec::new(),
                     material_options: Vec::new(),
+                    wall_finish_options: Vec::new(),
+                    ceiling_options: Vec::new(),
                     wall_kind: None,
+                    wall_finish: None,
                     actions: vec![
                         (
                             t.s("置顶", "To front"),
@@ -3809,6 +5036,19 @@ impl SceneState {
                     .map(|m| m.price_per_m2)
                     .unwrap_or(0.0);
                 let (net, billed, _, cost) = self.room_quote(id).unwrap_or((0.0, 0.0, 0.0, 0.0));
+                let furn_count = self
+                    .doc
+                    .furniture
+                    .iter()
+                    .filter(|f| f.room_id == Some(id))
+                    .count();
+                let furn_cost: f64 = self
+                    .doc
+                    .furniture
+                    .iter()
+                    .filter(|f| f.room_id == Some(id))
+                    .map(|f| f.effective_price())
+                    .sum();
                 let fields = vec![
                     InspectorField {
                         group: t.s("规格", "Spec").into(),
@@ -3838,11 +5078,25 @@ impl SceneState {
                         unit: format!("{billed:.1} m²"),
                         edit: None,
                     },
+                    InspectorField {
+                        group: t.s("造价", "Cost").into(),
+                        label: t.s("家具", "Furniture").into(),
+                        value: format!("¥{furn_cost:.0}"),
+                        unit: format!("{furn_count} 件"),
+                        edit: None,
+                    },
+                    InspectorField {
+                        group: t.s("造价", "Cost").into(),
+                        label: t.s("房间合计", "Room total").into(),
+                        value: format!("¥{:.0}", cost + furn_cost),
+                        unit: String::new(),
+                        edit: None,
+                    },
                 ];
                 return Some(InspectorView {
                     title: r.name.clone(),
                     subtitle: t
-                        .f("房间 · 地面材质与造价", "Room · flooring & quote")
+                        .f("房间 · 地面/顶面饰面与造价", "Room · floor & ceiling finishes")
                         .into(),
                     kind: InspectorKind::Room,
                     fields,
@@ -3853,9 +5107,33 @@ impl SceneState {
                         .doc
                         .materials
                         .iter()
-                        .map(|m| (m.name.clone(), m.id, r.material_id == Some(m.id)))
+                        .filter(|m| m.surface == FinishSurface::Floor)
+                        .map(|m| {
+                            (
+                                m.name.clone(),
+                                m.color.clone(),
+                                m.id,
+                                r.material_id == Some(m.id),
+                            )
+                        })
+                        .collect(),
+                    wall_finish_options: Vec::new(),
+                    ceiling_options: self
+                        .doc
+                        .materials
+                        .iter()
+                        .filter(|m| m.surface == FinishSurface::Ceiling)
+                        .map(|m| {
+                            (
+                                m.name.clone(),
+                                m.color.clone(),
+                                m.id,
+                                r.ceiling_material_id == Some(m.id),
+                            )
+                        })
                         .collect(),
                     wall_kind: None,
+                    wall_finish: None,
                     actions: vec![(t.s("重命名", "Rename"), InspectorAction::RenameRoom)],
                 });
             }
@@ -3889,8 +5167,8 @@ impl SceneState {
                 return Some(InspectorView {
                     title: wall_kind_name(w.kind).to_string(),
                     subtitle: t.f(
-                        &format!("墙体 · 长度 {len:.0} mm · 可编辑长度、厚度与高度"),
-                        &format!("Wall · {len:.0} mm · editable length, thickness & height"),
+                        &format!("墙体 · 长度 {len:.0} mm · 饰面来自饰面库"),
+                        &format!("Wall · {len:.0} mm · finish comes from the library"),
                     ),
                     kind: InspectorKind::Wall,
                     fields,
@@ -3898,8 +5176,30 @@ impl SceneState {
                     swatches: Vec::new(),
                     lines: Vec::new(),
                     material_options: Vec::new(),
+                    wall_finish_options: self
+                        .doc
+                        .materials
+                        .iter()
+                        .filter(|m| m.surface == FinishSurface::Wall)
+                        .map(|m| {
+                            (
+                                m.name.clone(),
+                                m.color.clone(),
+                                m.id,
+                                w.finish_id == Some(m.id),
+                            )
+                        })
+                        .collect(),
+                    ceiling_options: Vec::new(),
                     wall_kind: Some(w.kind),
-                    actions: vec![(t.s("删除", "Delete"), InspectorAction::RemoveWall)],
+                    wall_finish: Some(w.finish),
+                    actions: vec![
+                        (
+                            t.s("应用到本层", "Apply to floor"),
+                            InspectorAction::ApplyWallFinishToFloor,
+                        ),
+                        (t.s("删除", "Delete"), InspectorAction::RemoveWall),
+                    ],
                 });
             }
         } else if self.selection.len() > 1 {
@@ -3915,8 +5215,19 @@ impl SceneState {
                 swatches: Vec::new(),
                 lines: vec![t.f("批量操作暂只支持删除", "bulk edit: delete only")],
                 material_options: Vec::new(),
+                wall_finish_options: self
+                    .doc
+                    .materials
+                    .iter()
+                    .filter(|m| m.surface == FinishSurface::Wall)
+                    .map(|m| (m.name.clone(), m.color.clone(), m.id, false))
+                    .collect(),
+                ceiling_options: Vec::new(),
                 wall_kind: None,
-                actions: vec![(t.s("删除", "Delete"), InspectorAction::RemoveWall)],
+                wall_finish: None,
+                actions: vec![
+                    (t.s("批量删除", "Delete all"), InspectorAction::RemoveWall),
+                ],
             });
         }
         None
@@ -3925,6 +5236,13 @@ impl SceneState {
     pub fn apply_action(&mut self, action: InspectorAction) {
         match action {
             InspectorAction::CycleWallKind => self.cycle_wall_kind(),
+            InspectorAction::SetWallFinish(finish) => self.set_wall_finish(finish),
+            InspectorAction::SetWallFinishMaterial(id) => self.set_wall_finish_material(id),
+            InspectorAction::ApplyWallFinishToSelection(id) => {
+                self.apply_wall_finish_to_selection(id)
+            }
+            InspectorAction::ApplyWallFinishToFloor => self.apply_wall_finish_to_floor(),
+            InspectorAction::SetCeilingMaterial(id) => self.set_room_ceiling_material(id),
             InspectorAction::WallThickness(d) => self.adjust_wall(d, 0),
             InspectorAction::WallHeight(d) => self.adjust_wall(0, d),
             InspectorAction::RemoveWall => self.delete_selection(),
@@ -3945,6 +5263,7 @@ impl SceneState {
             InspectorAction::FurnitureSetDepth(v) => self.set_furniture_size(None, Some(v)),
             InspectorAction::FurnitureSetX(v) => self.set_furniture_position(Some(v), None),
             InspectorAction::FurnitureSetY(v) => self.set_furniture_position(None, Some(v)),
+            InspectorAction::FurnitureSetPrice(v) => self.set_furniture_price(v),
             InspectorAction::WallSetThickness(v) => self.set_wall_size(Some(v), None),
             InspectorAction::WallSetHeight(v) => self.set_wall_size(None, Some(v)),
             InspectorAction::WallSetLength(v) => self.set_wall_length(v),
@@ -3952,6 +5271,7 @@ impl SceneState {
             InspectorAction::OpeningSetWidth(v) => self.set_opening_size(Some(v), None, None),
             InspectorAction::OpeningSetHeight(v) => self.set_opening_size(None, Some(v), None),
             InspectorAction::OpeningSetSill(v) => self.set_opening_size(None, None, Some(v)),
+            InspectorAction::OpeningSetPrice(v) => self.set_opening_price(v),
             InspectorAction::FurnitureBringFront => self.move_furniture_layer(true),
             InspectorAction::FurnitureSendBack => self.move_furniture_layer(false),
             InspectorAction::FurnitureAlignLeft => self.align_furniture(0, 0),
@@ -3963,6 +5283,16 @@ impl SceneState {
             InspectorAction::RemoveFurniture => self.delete_selection(),
             InspectorAction::OpeningFlipSwing => self.flip_opening_swing(),
             InspectorAction::OpeningFlipHinge => self.flip_opening_hinge(),
+            InspectorAction::StairSetWidth(v) => {
+                let _ = self.set_selected_stair_size(Some(v), None);
+            }
+            InspectorAction::StairSetSteps(v) => {
+                let _ = self.set_selected_stair_size(None, Some(v));
+            }
+            InspectorAction::StairReverse => {
+                self.reverse_selected_stair();
+            }
+            InspectorAction::RemoveStair => self.delete_selection(),
         }
         self.touch();
     }
@@ -4034,6 +5364,161 @@ impl SceneState {
             }),
             &mut self.doc,
         );
+    }
+
+    fn set_wall_finish(&mut self, finish: WallFinish) {
+        let Some(id) = self.selected_wall_id() else {
+            return;
+        };
+        let Some(w) = self.doc.walls.iter().find(|w| w.id == id) else {
+            return;
+        };
+        let kind = match finish {
+            WallFinish::Paint => "paint",
+            WallFinish::Wallpaper => "wallpaper",
+            WallFinish::WoodPanel => "wood_panel",
+            WallFinish::Tile => "tile",
+        };
+        let after_id = crate::templates::built_in_finish_id(&self.doc, FinishSurface::Wall, kind);
+        let before = (w.finish_id, w.finish);
+        let after = (after_id, finish);
+        if before == after {
+            return;
+        }
+        self.history.execute(
+            Box::new(SetWallFinishId { id, before, after }),
+            &mut self.doc,
+        );
+        self.touch();
+    }
+
+    /// Pick a wall finish from the library. The legacy enum stays in sync so
+    /// an older reader still sees the closest built-in type.
+    fn set_wall_finish_material(&mut self, material: EntityId) {
+        let Some(wall_id) = self.selected_wall_id() else {
+            return;
+        };
+        let Some(material_record) = self
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.id == material && m.surface == FinishSurface::Wall)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(wall) = self.doc.walls.iter().find(|w| w.id == wall_id) else {
+            return;
+        };
+        let before = (wall.finish_id, wall.finish);
+        let after_finish = match material_record.kind.as_str() {
+            "wallpaper" => WallFinish::Wallpaper,
+            "wood_panel" => WallFinish::WoodPanel,
+            "tile" => WallFinish::Tile,
+            _ => WallFinish::Paint,
+        };
+        if before == (Some(material), after_finish) {
+            return;
+        }
+        self.history.execute(
+            Box::new(SetWallFinishId {
+                id: wall_id,
+                before,
+                after: (Some(material), after_finish),
+            }),
+            &mut self.doc,
+        );
+        self.touch();
+    }
+
+    fn apply_wall_finish_to_selection(&mut self, material: EntityId) {
+        let ids: Vec<EntityId> = self.selection.clone();
+        if ids.is_empty() {
+            return;
+        }
+        self.apply_wall_finish_to_walls(&ids, material);
+    }
+
+    fn apply_wall_finish_to_floor(&mut self) {
+        let Some(wall) = self.selected_wall_id().and_then(|id| {
+            self.doc.walls.iter().find(|w| w.id == id)
+        }) else {
+            return;
+        };
+        let floor = wall.floor;
+        let Some(finish_id) = wall.finish_id else {
+            return;
+        };
+        let ids: Vec<EntityId> = self
+            .doc
+            .walls
+            .iter()
+            .filter(|w| w.floor == floor)
+            .map(|w| w.id)
+            .collect();
+        self.apply_wall_finish_to_walls(&ids, finish_id);
+    }
+
+    fn apply_wall_finish_to_walls(&mut self, ids: &[EntityId], material: EntityId) {
+        let Some(record) = self
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.id == material && m.surface == FinishSurface::Wall)
+            .cloned()
+        else {
+            return;
+        };
+        let finish = match record.kind.as_str() {
+            "wallpaper" => WallFinish::Wallpaper,
+            "wood_panel" => WallFinish::WoodPanel,
+            "tile" => WallFinish::Tile,
+            _ => WallFinish::Paint,
+        };
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for wall in self.doc.walls.iter().filter(|w| ids.contains(&w.id)) {
+            before.push((wall.id, wall.finish_id, wall.finish));
+            after.push((wall.id, Some(material), finish));
+        }
+        if before == after {
+            return;
+        }
+        self.history.execute(
+            Box::new(SetWallFinishes { before, after }),
+            &mut self.doc,
+        );
+        self.touch();
+    }
+
+    fn set_room_ceiling_material(&mut self, material: EntityId) {
+        let Some(room_id) = self.selected_room else {
+            return;
+        };
+        let valid = self
+            .doc
+            .materials
+            .iter()
+            .any(|m| m.id == material && m.surface == FinishSurface::Ceiling);
+        if !valid {
+            return;
+        }
+        let Some(room) = self.doc.rooms.iter().find(|r| r.id == room_id) else {
+            return;
+        };
+        let before = room.ceiling_material_id;
+        if before == Some(material) {
+            return;
+        }
+        self.history.execute(
+            Box::new(SetRoomCeilingMaterial {
+                room_id,
+                before,
+                after: Some(material),
+            }),
+            &mut self.doc,
+        );
+        self.touch();
     }
 
     fn set_wall_length(&mut self, length_mm: i32) {
@@ -4153,6 +5638,28 @@ impl SceneState {
             .execute(Box::new(SetOpening { id, before, after }), &mut self.doc);
     }
 
+    fn set_opening_price(&mut self, price: i32) {
+        let Some(id) = self.selected_opening else {
+            return;
+        };
+        let Some(o) = self.doc.openings.iter().find(|o| o.id == id) else {
+            return;
+        };
+        let after = Some(price.clamp(0, 1_000_000) as f64);
+        if o.price == after {
+            return;
+        }
+        self.history.execute(
+            Box::new(SetOpeningPrice {
+                id,
+                before: o.price,
+                after,
+            }),
+            &mut self.doc,
+        );
+        self.note = Some(format!("门窗单价改为 ¥{price}"));
+    }
+
     fn adjust_opening(&mut self, dw: i32, dh: i32, dsill: i32) {
         let Some(id) = self.selected_opening else {
             return;
@@ -4184,16 +5691,24 @@ impl SceneState {
         }
     }
 
-    /// Opening under the cursor, measured against the wall centreline segment.
+    /// Opening under the cursor. Doors are picked by their whole swing area,
+    /// not just the leaf line: the drawn arc and the leaf itself sit away from
+    /// the wall centreline, so a centreline-only hit test made doors feel
+    /// unselectable.
     fn hit_opening(&self) -> Option<EntityId> {
         let world = self.pointer_world();
-        let tol = (10.0 / self.cam.scale).max(120.0);
+        let tol = (12.0 / self.cam.scale).max(160.0);
         self.doc
             .openings
             .iter()
             .rev()
             .find(|o| {
-                let Some(w) = self.doc.walls.iter().find(|w| w.id == o.wall_id) else {
+                let Some(w) = self
+                    .doc
+                    .walls
+                    .iter()
+                    .find(|w| w.id == o.wall_id && w.floor == self.floor())
+                else {
                     return false;
                 };
                 let len = ((w.end.x - w.start.x) as f64).hypot((w.end.y - w.start.y) as f64);
@@ -4210,7 +5725,36 @@ impl SceneState {
                 };
                 let a = at(o.offset_mm);
                 let b = at(o.offset_mm + o.width_mm);
-                distance_point_segment(world, a, b) <= tol
+                if distance_point_segment(world, a, b) <= tol {
+                    return true;
+                }
+                if matches!(o.kind, OpeningKind::Door | OpeningKind::Sliding) {
+                    let side = if o.swing_deg >= 0.0 { 1.0 } else { -1.0 };
+                    let nx = -dy * side;
+                    let ny = dx * side;
+                    let hinge = if o.hinge_right { b } else { a };
+                    let jamb = if o.hinge_right { a } else { b };
+                    let leaf_end = Pt::new(
+                        (hinge.x as f64 + nx * o.width_mm as f64).round() as i32,
+                        (hinge.y as f64 + ny * o.width_mm as f64).round() as i32,
+                    );
+                    if distance_point_segment(world, hinge, leaf_end) <= tol {
+                        return true;
+                    }
+                    // The drawn swing arc is a quarter circle of radius = door
+                    // width. Pick it only in that sector, not a full disc, so
+                    // clicking the floor around a door does not hijack the room.
+                    let vx = (world.x - hinge.x) as f64;
+                    let vy = (world.y - hinge.y) as f64;
+                    let jx = (jamb.x - hinge.x) as f64;
+                    let jy = (jamb.y - hinge.y) as f64;
+                    let in_sector = vx * nx + vy * ny >= -1.0 && vx * jx + vy * jy >= -1.0;
+                    let radius = vx.hypot(vy);
+                    if in_sector && (radius - o.width_mm as f64).abs() <= tol {
+                        return true;
+                    }
+                }
+                false
             })
             .map(|o| o.id)
     }
@@ -4221,8 +5765,9 @@ impl SceneState {
         if self.view != ViewMode::Plan {
             return out;
         }
+        let floor = self.floor();
         if self.doc.settings.show_dimensions {
-            for wall in &self.doc.walls {
+            for wall in self.doc.walls.iter().filter(|w| w.floor == floor) {
                 let a = self.cam.world_to_screen(wall.start);
                 let b = self.cam.world_to_screen(wall.end);
                 let len_px = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
@@ -4280,7 +5825,7 @@ impl SceneState {
                 });
             }
         }
-        for room in &self.doc.rooms {
+        for room in self.doc.rooms.iter().filter(|r| r.floor == floor) {
             if !self.doc.settings.show_room_names {
                 break;
             }
@@ -4411,44 +5956,70 @@ impl SceneState {
 /// Recover rooms from wall centrelines, keeping names/materials of rooms whose
 /// old polygon still contains the new room's centroid.
 fn recompute_rooms(doc: &mut Document) {
-    let segments: Vec<(Pt, Pt)> = doc.walls.iter().map(|w| (w.start, w.end)).collect();
-    let polygons = detect_rooms(&segments, 10, 0.3);
+    let levels = doc.level_count();
     let old = doc.rooms.clone();
-    let default_material = doc.materials.first().map(|m| m.id);
+    let default_material = doc
+        .materials
+        .iter()
+        .find(|m| m.surface == FinishSurface::Floor)
+        .map(|m| m.id);
+    let default_ceiling =
+        crate::templates::built_in_finish_id(doc, FinishSurface::Ceiling, "paint");
     let mut fallback = doc.next_id();
-    let mut rooms = Vec::new();
-    for polygon in polygons {
-        let n = polygon.len().max(1) as f64;
-        let cx = polygon.iter().map(|p| p.x as f64).sum::<f64>() / n;
-        let cy = polygon.iter().map(|p| p.y as f64).sum::<f64>() / n;
-        let centroid = Pt::new(cx.round() as i32, cy.round() as i32);
-        let hit = old
+    let mut rooms: Vec<Room> = Vec::new();
+    for floor in 0..levels {
+        let segments: Vec<(Pt, Pt)> = doc
+            .walls
             .iter()
-            .find(|r| r.polygon.len() >= 3 && point_in_polygon(centroid, &r.polygon));
-        let (id, name, material_id, counted) = match hit {
-            Some(r) => (r.id, r.name.clone(), r.material_id, r.counted),
-            None => {
-                let id = EntityId(fallback);
-                fallback += 1;
-                (
-                    id,
-                    format!("房间 {}", rooms.len() + 1),
-                    default_material,
-                    true,
-                )
-            }
-        };
-        rooms.push(Room {
-            id,
-            polygon,
-            name,
-            material_id,
-            counted,
-        });
+            .filter(|w| w.floor as usize == floor)
+            .map(|w| (w.start, w.end))
+            .collect();
+        let polygons = detect_rooms(&segments, ROOM_JOIN_TOLERANCE_MM, 0.3);
+        let old_floor: Vec<&Room> = old.iter().filter(|r| r.floor as usize == floor).collect();
+        for polygon in polygons {
+            let n = polygon.len().max(1) as f64;
+            let cx = polygon.iter().map(|p| p.x as f64).sum::<f64>() / n;
+            let cy = polygon.iter().map(|p| p.y as f64).sum::<f64>() / n;
+            let centroid = Pt::new(cx.round() as i32, cy.round() as i32);
+            let hit = old_floor
+                .iter()
+                .find(|r| r.polygon.len() >= 3 && point_in_polygon(centroid, &r.polygon));
+            let (id, name, material_id, counted, ceiling_material_id) = match hit {
+                Some(r) => (
+                    r.id,
+                    r.name.clone(),
+                    r.material_id,
+                    r.counted,
+                    r.ceiling_material_id,
+                ),
+                None => {
+                    let id = EntityId(fallback);
+                    fallback += 1;
+                    (
+                        id,
+                        format!(
+                            "房间 {}",
+                            rooms.iter().filter(|r| r.floor as usize == floor).count() + 1
+                        ),
+                        default_material,
+                        true,
+                        default_ceiling,
+                    )
+                }
+            };
+            rooms.push(Room {
+                id,
+                polygon,
+                name,
+                material_id,
+                counted,
+                floor: floor as u32,
+                ceiling_material_id,
+            });
+        }
     }
     doc.rooms = rooms;
 }
-
 // ------------------------------------------------------------------- commands
 
 struct AddMeasure {
@@ -4482,6 +6053,103 @@ impl Command for ClearMeasures {
     }
     fn undo(&mut self, doc: &mut Document) {
         doc.measures = self.before.clone();
+    }
+}
+
+struct LevelSnapshot {
+    before: Document,
+    after: Document,
+    label: &'static str,
+}
+
+impl Command for LevelSnapshot {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        *doc = self.after.clone();
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        *doc = self.before.clone();
+    }
+}
+
+struct RoofSnapshot {
+    before: Document,
+    after: Document,
+    label: &'static str,
+}
+
+impl Command for RoofSnapshot {
+    fn label(&self) -> &str {
+        self.label
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        *doc = self.after.clone();
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        *doc = self.before.clone();
+    }
+}
+
+struct AddStair {
+    stair: Stair,
+}
+
+impl Command for AddStair {
+    fn label(&self) -> &str {
+        "add stair"
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        doc.stairs.push(self.stair.clone());
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        doc.stairs.retain(|s| s.id != self.stair.id);
+    }
+}
+
+struct UpdateStair {
+    before: Stair,
+    after: Stair,
+}
+
+impl Command for UpdateStair {
+    fn label(&self) -> &str {
+        "update stair"
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        if let Some(stair) = doc.stairs.iter_mut().find(|s| s.id == self.after.id) {
+            *stair = self.after.clone();
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        if let Some(stair) = doc.stairs.iter_mut().find(|s| s.id == self.before.id) {
+            *stair = self.before.clone();
+        }
+    }
+}
+
+struct RemoveStair {
+    stair: Stair,
+}
+
+impl Command for RemoveStair {
+    fn label(&self) -> &str {
+        "remove stair"
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        doc.stairs.retain(|s| s.id != self.stair.id);
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        doc.stairs.push(self.stair.clone());
     }
 }
 
@@ -4721,6 +6389,33 @@ impl Command for SetWallKind {
     }
 }
 
+struct SetWallFinishes {
+    before: Vec<(EntityId, Option<EntityId>, WallFinish)>,
+    after: Vec<(EntityId, Option<EntityId>, WallFinish)>,
+}
+
+impl Command for SetWallFinishes {
+    fn label(&self) -> &str {
+        "set-wall-finishes"
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        for (id, finish_id, finish) in &self.after {
+            if let Some(w) = doc.walls.iter_mut().find(|w| w.id == *id) {
+                w.finish_id = *finish_id;
+                w.finish = *finish;
+            }
+        }
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        for (id, finish_id, finish) in &self.before {
+            if let Some(w) = doc.walls.iter_mut().find(|w| w.id == *id) {
+                w.finish_id = *finish_id;
+                w.finish = *finish;
+            }
+        }
+    }
+}
+
 struct SetWallSize {
     id: EntityId,
     before: (i32, i32),
@@ -4763,6 +6458,45 @@ impl Command for MoveOpening {
     fn undo(&mut self, doc: &mut Document) {
         if let Some(o) = doc.openings.iter_mut().find(|o| o.id == self.id) {
             o.offset_mm = self.before;
+        }
+    }
+}
+
+struct SetQuoteSettings {
+    before: QuoteSettings,
+    after: QuoteSettings,
+}
+
+impl Command for SetQuoteSettings {
+    fn label(&self) -> &str {
+        "set-quote-settings"
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        doc.quote = self.after.clone();
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        doc.quote = self.before.clone();
+    }
+}
+
+struct SetOpeningPrice {
+    id: EntityId,
+    before: Option<f64>,
+    after: Option<f64>,
+}
+
+impl Command for SetOpeningPrice {
+    fn label(&self) -> &str {
+        "set-opening-price"
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        if let Some(o) = doc.openings.iter_mut().find(|o| o.id == self.id) {
+            o.price = self.after;
+        }
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        if let Some(o) = doc.openings.iter_mut().find(|o| o.id == self.id) {
+            o.price = self.before;
         }
     }
 }
@@ -4879,6 +6613,28 @@ impl Command for SetFurniture {
     }
 }
 
+struct SetFurniturePrice {
+    id: EntityId,
+    before: Option<f64>,
+    after: Option<f64>,
+}
+
+impl Command for SetFurniturePrice {
+    fn label(&self) -> &str {
+        "set-furniture-price"
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        if let Some(f) = doc.furniture.iter_mut().find(|f| f.id == self.id) {
+            f.price = self.after;
+        }
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        if let Some(f) = doc.furniture.iter_mut().find(|f| f.id == self.id) {
+            f.price = self.before;
+        }
+    }
+}
+
 struct RemoveFurnitureBatch {
     items: Vec<(usize, Furniture)>,
 }
@@ -4944,6 +6700,26 @@ fn move_furniture_to(doc: &mut Document, id: EntityId, target: usize) {
     doc.furniture.insert(at, item);
 }
 
+struct MaterialSnapshot {
+    before: Vec<Material>,
+    after: Vec<Material>,
+    label: &'static str,
+}
+
+impl Command for MaterialSnapshot {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn apply(&mut self, doc: &mut Document) {
+        doc.materials = self.after.clone();
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        doc.materials = self.before.clone();
+    }
+}
+
 struct SetRoomMaterial {
     room_id: EntityId,
     before: Option<EntityId>,
@@ -4962,6 +6738,52 @@ impl Command for SetRoomMaterial {
     fn undo(&mut self, doc: &mut Document) {
         if let Some(r) = doc.rooms.iter_mut().find(|r| r.id == self.room_id) {
             r.material_id = self.before;
+        }
+    }
+}
+
+struct SetWallFinishId {
+    id: EntityId,
+    before: (Option<EntityId>, WallFinish),
+    after: (Option<EntityId>, WallFinish),
+}
+
+impl Command for SetWallFinishId {
+    fn label(&self) -> &str {
+        "set-wall-finish-id"
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        if let Some(w) = doc.walls.iter_mut().find(|w| w.id == self.id) {
+            w.finish_id = self.after.0;
+            w.finish = self.after.1;
+        }
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        if let Some(w) = doc.walls.iter_mut().find(|w| w.id == self.id) {
+            w.finish_id = self.before.0;
+            w.finish = self.before.1;
+        }
+    }
+}
+
+struct SetRoomCeilingMaterial {
+    room_id: EntityId,
+    before: Option<EntityId>,
+    after: Option<EntityId>,
+}
+
+impl Command for SetRoomCeilingMaterial {
+    fn label(&self) -> &str {
+        "set-room-ceiling-material"
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        if let Some(r) = doc.rooms.iter_mut().find(|r| r.id == self.room_id) {
+            r.ceiling_material_id = self.after;
+        }
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        if let Some(r) = doc.rooms.iter_mut().find(|r| r.id == self.room_id) {
+            r.ceiling_material_id = self.before;
         }
     }
 }
@@ -5150,6 +6972,32 @@ pub fn plan_bounds(doc: &Document) -> (Pt, Pt) {
     let mut max = Pt::new(i32::MIN, i32::MIN);
     for wall in &doc.walls {
         for p in [wall.start, wall.end] {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+        }
+    }
+    if min.x > max.x {
+        (Pt::new(0, 0), Pt::new(10_000, 8_000))
+    } else {
+        (min, max)
+    }
+}
+
+pub fn plan_bounds_for_floor(doc: &Document, floor: u32) -> (Pt, Pt) {
+    let mut min = Pt::new(i32::MAX, i32::MAX);
+    let mut max = Pt::new(i32::MIN, i32::MIN);
+    for wall in doc.walls.iter().filter(|w| w.floor == floor) {
+        for p in [wall.start, wall.end] {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+        }
+    }
+    for room in doc.rooms.iter().filter(|r| r.floor == floor) {
+        for p in &room.polygon {
             min.x = min.x.min(p.x);
             min.y = min.y.min(p.y);
             max.x = max.x.max(p.x);
@@ -5368,6 +7216,8 @@ mod tests {
             rotation_deg: 0.0,
             color: "#C9A227".into(),
             room_id: None,
+            price: None,
+            floor: 0,
         });
         let hit = pick_scene(&s.doc, Vec3::new(3.0, 3.0, 2.0), Vec3::new(0.0, -1.0, 0.0));
         assert!(matches!(hit, Some(Pick3d::Furniture(_))), "{hit:?}");
@@ -5399,6 +7249,32 @@ mod tests {
         let len = ((w.end.x - w.start.x) as f64).hypot((w.end.y - w.start.y) as f64);
         assert!(len > 1000.0, "drag should span a room, got {len}");
         assert!(s.draft.is_none());
+    }
+
+    #[test]
+    fn drawing_a_wall_near_a_corner_snaps_to_the_existing_endpoint() {
+        let mut s = room_state();
+        let existing_end = s.doc.walls[0].end;
+        s.set_tool(Tool::Wall);
+        let start = s.cam.world_to_screen(Pt::new(existing_end.x, existing_end.y + 35));
+        s.pointer_down(start, PointerButton::Left, false);
+        let end = s.cam.world_to_screen(Pt::new(existing_end.x + 2000, existing_end.y));
+        s.pointer_down(end, PointerButton::Left, false);
+        assert_eq!(s.doc.walls.len(), 5);
+        let added = s.doc.walls.last().unwrap();
+        assert_eq!(added.start, existing_end, "start must weld to the corner");
+    }
+
+    #[test]
+    fn drawing_a_wall_near_an_existing_wall_projects_a_t_junction() {
+        let mut s = room_state();
+        s.set_tool(Tool::Wall);
+        let start = s.cam.world_to_screen(Pt::new(3000, 45));
+        let end = s.cam.world_to_screen(Pt::new(3000, 4000));
+        s.pointer_down(start, PointerButton::Left, false);
+        s.pointer_down(end, PointerButton::Left, false);
+        let added = s.doc.walls.last().unwrap();
+        assert_eq!(added.start, Pt::new(3000, 0), "T-junction snapped to wall");
     }
 
     #[test]
@@ -5686,6 +7562,99 @@ mod tests {
             (s.doc.furniture[0].width_mm, s.doc.furniture[0].depth_mm),
             before
         );
+    }
+
+    #[test]
+    fn wall_finish_is_inspector_editable_and_undoable() {
+        let mut s = empty();
+        draw_rect(&mut s);
+        s.selection = vec![s.doc.walls[0].id];
+        let view = s.inspector().expect("wall inspector");
+        assert_eq!(view.wall_finish, Some(WallFinish::Paint));
+        assert!(s.doc.walls[0].finish == WallFinish::Paint);
+        s.apply_action(InspectorAction::SetWallFinish(WallFinish::WoodPanel));
+        assert_eq!(s.doc.walls[0].finish, WallFinish::WoodPanel);
+        assert!(
+            s.mesh3d().iter().any(|v| v.pattern == 11.0),
+            "wood finish reaches the 3D mesh"
+        );
+        s.key("z", true, false);
+        assert_eq!(s.doc.walls[0].finish, WallFinish::Paint);
+    }
+
+    #[test]
+    fn wall_finish_library_choice_is_undoable() {
+        let mut s = empty();
+        draw_rect(&mut s);
+        s.selection = vec![s.doc.walls[0].id];
+        let view = s.inspector().expect("wall inspector");
+        assert_eq!(view.wall_finish_options.len(), 4);
+        let tile_id = s
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.surface == FinishSurface::Wall && m.kind == "tile")
+            .map(|m| m.id)
+            .expect("wall tile preset");
+        s.apply_action(InspectorAction::SetWallFinishMaterial(tile_id));
+        assert_eq!(s.doc.walls[0].finish_id, Some(tile_id));
+        assert_eq!(s.doc.walls[0].finish, WallFinish::Tile);
+        assert!(s.mesh3d().iter().any(|v| v.pattern == 6.0));
+        s.key("z", true, false);
+        assert_eq!(s.doc.walls[0].finish_id, None);
+        assert_eq!(s.doc.walls[0].finish, WallFinish::Paint);
+    }
+
+    #[test]
+    fn finish_can_be_applied_to_selection_and_floor() {
+        let mut s = empty();
+        draw_rect(&mut s);
+        let tile_id = s
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.surface == FinishSurface::Wall && m.kind == "tile")
+            .map(|m| m.id)
+            .expect("wall tile preset");
+
+        let all: Vec<EntityId> = s.doc.walls.iter().map(|w| w.id).collect();
+        s.selection = all.clone();
+        s.apply_action(InspectorAction::ApplyWallFinishToSelection(tile_id));
+        assert!(s.doc.walls.iter().all(|w| w.finish_id == Some(tile_id)));
+        s.key("z", true, false);
+        assert!(s.doc.walls.iter().all(|w| w.finish_id.is_none()));
+
+        s.selection = vec![all[0]];
+        s.apply_action(InspectorAction::SetWallFinishMaterial(tile_id));
+        s.apply_action(InspectorAction::ApplyWallFinishToFloor);
+        assert!(s.doc.walls.iter().all(|w| w.finish_id == Some(tile_id)));
+        s.key("z", true, false);
+        assert_eq!(s.doc.walls[0].finish_id, Some(tile_id));
+        assert!(s.doc.walls[1..].iter().all(|w| w.finish_id.is_none()));
+    }
+
+    #[test]
+    fn room_ceiling_finish_is_undoable_and_quoted() {
+        let mut s = empty();
+        draw_rect(&mut s);
+        s.selected_room = Some(s.doc.rooms[0].id);
+        let before = s.doc.rooms[0].ceiling_material_id;
+        let view = s.inspector().expect("room inspector");
+        assert_eq!(view.ceiling_options.len(), 2);
+        let wood_id = s
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.surface == FinishSurface::Ceiling && m.kind == "wood_panel")
+            .map(|m| m.id)
+            .expect("ceiling wood preset");
+        s.apply_action(InspectorAction::SetCeilingMaterial(wood_id));
+        assert_eq!(s.doc.rooms[0].ceiling_material_id, Some(wood_id));
+        let quote = crate::quote::Quote::compute(&s.doc);
+        assert!(quote.ceiling_material > 0.0);
+        assert!(quote.finish_rows.iter().any(|r| r.surface == "顶面"));
+        s.key("z", true, false);
+        assert_eq!(s.doc.rooms[0].ceiling_material_id, before);
     }
 
     #[test]
@@ -6034,6 +8003,8 @@ mod tests {
             rotation_deg: 0.0,
             color: String::new(),
             room_id: None,
+            price: None,
+            floor: 0,
         });
         s.selected_furniture = Some(EntityId(7));
         s.set_tool(Tool::Select);
@@ -6091,6 +8062,7 @@ mod tests {
             sill_mm: 0,
             swing_deg: 90.0,
             hinge_right: false,
+            price: None,
         });
         s.set_view(ViewMode::Walk);
         s.walk.pos = glam::Vec3::new(1.95, 1.6, 0.8);
@@ -6124,6 +8096,7 @@ mod tests {
             sill_mm: 0,
             swing_deg: 90.0,
             hinge_right: false,
+            price: None,
         };
         s.doc.openings.push(opening.clone());
         s.set_view(ViewMode::Walk);
@@ -6166,6 +8139,7 @@ mod tests {
             sill_mm: 0,
             swing_deg: 90.0,
             hinge_right: false,
+            price: None,
         });
         s.cutaway = false;
         let full = s.mesh3d().iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
@@ -6505,12 +8479,20 @@ mod tests {
             name: "橡木".into(),
             price_per_m2: 0.0,
             kind: "wood".into(),
+            color: "#c49a6c".into(),
+            surface: fp_model::FinishSurface::Floor,
+            waste_rate: fp_model::default_waste_rate(),
+            built_in: false,
         });
         s.doc.materials.push(Material {
             id: EntityId(2002),
             name: "瓷砖".into(),
             price_per_m2: 0.0,
             kind: "tile".into(),
+            color: "#a8b6c2".into(),
+            surface: fp_model::FinishSurface::Floor,
+            waste_rate: fp_model::default_waste_rate(),
+            built_in: false,
         });
         s.set_tool(Tool::Select);
         s.pointer_down([400.0, 250.0], PointerButton::Left, false);
@@ -6522,6 +8504,66 @@ mod tests {
         assert_eq!(s.doc.rooms[0].material_id, Some(EntityId(2002)));
         s.key("z", true, false);
         assert_eq!(s.doc.rooms[0].material_id, Some(EntityId(2001)));
+    }
+
+    #[test]
+    fn material_library_add_edit_delete_is_undoable() {
+        let mut s = empty();
+        s.doc.materials.clear();
+        let id = s.add_material();
+        let keep = s.add_material();
+        assert_eq!(s.doc.materials.len(), 2);
+        assert_eq!(s.doc.materials[0].name, "新材料");
+        assert_eq!(s.material_usage(id), 0);
+        let before = s.doc.materials[0].clone();
+        let after = Material {
+            id,
+            name: "赤陶砖".into(),
+            price_per_m2: 275.0,
+            kind: "tile".into(),
+            color: "#b4552d".into(),
+            surface: fp_model::FinishSurface::Floor,
+            waste_rate: fp_model::default_waste_rate(),
+            built_in: false,
+        };
+        s.update_material(after.clone());
+        assert_eq!(s.doc.materials[0], after);
+        s.remove_material(id);
+        assert_eq!(s.doc.materials.len(), 1, "unused material can go");
+        assert_eq!(s.doc.materials[0].id, keep);
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.materials.len(), 2);
+        assert_eq!(s.doc.materials[0], after);
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.materials[0], before);
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.materials.len(), 1);
+        s.history.undo(&mut s.doc);
+        assert!(s.doc.materials.is_empty());
+    }
+
+    #[test]
+    fn used_material_cannot_be_deleted() {
+        let mut s = empty();
+        s.doc.materials.clear();
+        let id = s.add_material();
+        s.doc.rooms.push(Room {
+            id: EntityId(3001),
+            polygon: vec![
+                Pt::new(0, 0),
+                Pt::new(2000, 0),
+                Pt::new(2000, 2000),
+                Pt::new(0, 2000),
+            ],
+            name: "测试房".into(),
+            material_id: Some(id),
+            counted: true,
+            floor: 0,
+            ceiling_material_id: None,
+        });
+        s.remove_material(id);
+        assert_eq!(s.doc.materials.len(), 1);
+        assert!(s.note.as_deref().unwrap_or("").contains("使用"));
     }
 
     #[test]
@@ -6660,6 +8702,25 @@ mod tests {
     }
 
     #[test]
+    fn paste_into_another_level_retags_the_copies() {
+        let mut s = room_state();
+        s.add_level(false);
+        s.set_level(0);
+        s.selection = s.doc.walls.iter().map(|w| w.id).collect();
+        let walls = s.doc.walls.len();
+        s.key("c", true, false);
+        s.set_level(1);
+        s.key("v", true, false);
+        assert_eq!(s.doc.walls.len(), walls * 2);
+        let pasted: Vec<_> = s.doc.walls.iter().filter(|w| w.floor == 1).collect();
+        assert_eq!(pasted.len(), walls);
+        assert!(s.doc.walls.iter().filter(|w| w.floor == 0).count() == walls);
+        s.key("z", true, false);
+        assert_eq!(s.doc.walls.len(), walls);
+        assert!(s.doc.walls.iter().all(|w| w.floor == 0));
+    }
+
+    #[test]
     fn paste_without_copy_is_a_no_op() {
         let mut s = room_state();
         let walls = s.doc.walls.len();
@@ -6699,6 +8760,7 @@ mod tests {
             sill_mm: 0,
             swing_deg: 0.0,
             hinge_right: false,
+            price: None,
         });
         s
     }
@@ -6730,6 +8792,21 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_door_leaf_selects_the_opening_not_the_wall() {
+        let mut s = room_with_door();
+        // The leaf is drawn perpendicular to the wall, outside the 160 mm
+        // centreline band. It used to fall through to wall selection.
+        let leaf = s.cam.world_to_screen(Pt::new(2000, 450));
+        s.pointer_down(leaf, PointerButton::Left, false);
+        s.pointer_up(leaf, PointerButton::Left, false);
+        assert_eq!(s.selected_opening, Some(EntityId(900)));
+        assert!(
+            s.selection.is_empty(),
+            "clicking a door leaf must not also select the wall"
+        );
+    }
+
+    #[test]
     fn a_click_on_a_door_does_not_change_its_offset() {
         let mut s = room_with_door();
         let at = s.cam.world_to_screen(Pt::new(2450, 0));
@@ -6738,6 +8815,165 @@ mod tests {
         assert_eq!(s.doc.openings[0].offset_mm, 2000);
         assert_eq!(s.history.undo_len(), 0);
     }
+    #[test]
+    fn copying_a_level_duplicates_walls_and_rooms() {
+        let mut s = room_state();
+        let base_walls = s.walls_for_floor(0).len();
+        assert!(base_walls >= 4);
+        s.add_level(true);
+        assert_eq!(s.active_level, 1);
+        assert_eq!(s.doc.level_count(), 2);
+        assert_eq!(s.walls_for_floor(1).len(), base_walls);
+        let unique: std::collections::HashSet<EntityId> =
+            s.doc.walls.iter().map(|w| w.id).collect();
+        assert_eq!(unique.len(), s.doc.walls.len(), "copied walls get new ids");
+        assert!(s.doc.rooms.iter().any(|r| r.floor == 1));
+        assert!((s.cam3.target.y - 4.0).abs() < 0.01, "camera rises to 2F");
+        let top = s
+            .mesh3d_with(false)
+            .vertices
+            .iter()
+            .map(|v| v.pos[1])
+            .fold(f32::MIN, f32::max);
+        assert!(top > 5.0, "2F geometry is stacked above 1F, top = {top}");
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.level_count(), 1);
+        assert!(s.doc.walls.iter().all(|w| w.floor == 0));
+    }
+
+    #[test]
+    fn roof_form_and_eave_are_editable_and_undoable() {
+        let mut s = room_state();
+        assert_eq!(s.roof_settings().kind, RoofKind::Gable);
+        assert_eq!(s.roof_settings().overhang_mm, 600);
+        s.set_roof_kind(RoofKind::Flat);
+        assert_eq!(s.doc.roof.kind, RoofKind::Flat);
+        s.set_roof_kind(RoofKind::Gable);
+        s.cycle_roof_pitch();
+        assert!(s.roof_settings().pitch_deg > 25.0);
+        s.cycle_roof_overhang();
+        assert_eq!(s.roof_settings().overhang_mm, 900);
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.roof.overhang_mm, 600);
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.roof.kind, RoofKind::Gable);
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.roof.kind, RoofKind::Flat);
+        s.set_roof(true);
+        assert!(s.show_roof);
+        assert!(s.mesh3d().len() > 0);
+    }
+
+    #[test]
+    fn roof_is_drawn_only_when_toggled() {
+        let mut s = room_state();
+        s.add_level(true);
+        let flat = s
+            .mesh3d_with(false)
+            .vertices
+            .iter()
+            .map(|v| v.pos[1])
+            .fold(f32::MIN, f32::max);
+        s.set_roof(true);
+        let roofed = s
+            .mesh3d_with(false)
+            .vertices
+            .iter()
+            .map(|v| v.pos[1])
+            .fold(f32::MIN, f32::max);
+        assert!(roofed > flat + 0.05, "roof adds a slab: {flat} → {roofed}");
+        s.set_roof(false);
+        assert!(
+            s.mesh3d_with(false)
+                .vertices
+                .iter()
+                .map(|v| v.pos[1])
+                .fold(f32::MIN, f32::max)
+                < roofed
+        );
+    }
+
+    #[test]
+    fn deleting_a_level_removes_its_entities_and_is_undoable() {
+        let mut s = room_state();
+        s.add_level(true);
+        let walls_before = s.doc.walls.len();
+        s.remove_active_level();
+        assert_eq!(s.doc.level_count(), 1);
+        assert!(s.doc.walls.iter().all(|w| w.floor == 0));
+        assert!(s.walls_for_floor(1).is_empty());
+        assert_eq!(s.doc.walls.len() * 2, walls_before);
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.level_count(), 2);
+        assert_eq!(s.doc.walls.len(), walls_before);
+    }
+
+    #[test]
+    fn stair_is_only_placed_between_levels() {
+        let mut s = room_state();
+        s.add_level(true);
+        s.set_level(0);
+        s.commit_stair(Pt::new(1000, 1000), Pt::new(4000, 1000));
+        assert_eq!(s.doc.stairs.len(), 1);
+        let stair = &s.doc.stairs[0];
+        assert_eq!(stair.floor, 0);
+        assert_eq!(stair.steps, 12);
+        s.set_level(1);
+        s.commit_stair(Pt::new(1000, 1000), Pt::new(4000, 1000));
+        assert_eq!(s.doc.stairs.len(), 1, "top floor has no stair target");
+        assert!(s.note.as_deref().unwrap_or("").contains("顶层"));
+        s.history.undo(&mut s.doc);
+        assert!(s.doc.stairs.is_empty());
+    }
+
+    #[test]
+    fn level_name_and_height_are_editable_and_undoable() {
+        let mut s = room_state();
+        s.add_level(true);
+        s.set_level(1);
+        assert_eq!(s.active_level_info(), ("2F".to_string(), 2800));
+        s.set_active_level_info("主卧层", 3200).unwrap();
+        assert_eq!(s.active_level_info(), ("主卧层".to_string(), 3200));
+        assert_eq!(s.doc.levels[1].height_mm, 3200);
+        assert!(s.set_active_level_info("", 3000).is_err());
+        assert!(s.set_active_level_info("X", 900).is_err());
+        s.history.undo(&mut s.doc);
+        assert_eq!(s.doc.levels[1].height_mm, 2800);
+        assert_eq!(s.doc.levels[1].name, "2F");
+    }
+
+    #[test]
+    fn stair_size_and_direction_are_editable_and_undoable() {
+        let mut s = room_state();
+        s.add_level(true);
+        s.set_level(0);
+        s.commit_stair(Pt::new(1000, 1000), Pt::new(4000, 1000));
+        let id = s.doc.stairs[0].id;
+        s.selected_stair = Some(id);
+        let before = s.selected_stair_info().unwrap();
+        s.set_selected_stair_size(Some(1200), Some(14)).unwrap();
+        let sized = s.selected_stair_info().unwrap();
+        assert_eq!(sized.width_mm, 1200);
+        assert_eq!(sized.steps, 14);
+        assert!(s.set_selected_stair_size(Some(500), None).is_err());
+        assert!(s.reverse_selected_stair());
+        let reversed = s.selected_stair_info().unwrap();
+        assert_eq!(reversed.start, before.end);
+        assert_eq!(reversed.end, before.start);
+        assert_eq!(reversed.width_mm, 1200);
+        let view = s.inspector().expect("stair inspector");
+        assert_eq!(view.kind, InspectorKind::Stair);
+        assert!(
+            view.actions
+                .iter()
+                .any(|(_, action)| matches!(action, InspectorAction::StairReverse))
+        );
+        s.history.undo(&mut s.doc);
+        let undone = s.selected_stair_info().unwrap();
+        assert_eq!(undone.start, before.start);
+        assert_eq!(undone.width_mm, 1200);
+    }
+
     #[test]
     fn walk_is_blocked_by_furniture() {
         let mut s = room_state();

@@ -6,7 +6,7 @@
 
 use fp_core::{EntityId, Pt};
 use fp_model::catalog::CATALOG;
-use fp_model::{Document, Furniture, Material, Opening, OpeningKind, Room, Wall, WallKind};
+use fp_model::{Document, FinishSurface, Furniture, Material, Opening, OpeningKind, Room, Wall, WallFinish, WallKind};
 
 use crate::i18n::Lang;
 
@@ -247,25 +247,61 @@ fn two_bed(lang: Lang) -> Document {
 /// The standard flooring palette. The web original has five swatches; Fathom
 /// keeps six priced options and gives every route (blank, templates, imported
 /// JSON) the same palette.
-pub const MATERIAL_LIBRARY: [(&str, f64, &str); 6] = [
-    ("橡木地板", 320.0, "wood"),
-    ("瓷砖", 180.0, "tile"),
-    ("大理石", 680.0, "marble"),
-    ("水磨石", 260.0, "terrazzo"),
-    ("地毯", 220.0, "carpet"),
-    ("微水泥", 240.0, "stone"),
+pub const MATERIAL_LIBRARY: [(&str, f64, &str, &str); 6] = [
+    ("橡木地板", 320.0, "wood", "#c49a6c"),
+    ("瓷砖", 180.0, "tile", "#a8b6c2"),
+    ("大理石", 680.0, "marble", "#d6d4cd"),
+    ("水磨石", 260.0, "terrazzo", "#cbc6b7"),
+    ("地毯", 220.0, "carpet", "#9e8c80"),
+    ("微水泥", 240.0, "stone", "#b8b4ac"),
 ];
 
-/// Append any missing standard material. Existing documents keep their ids and
-/// custom materials; matching is by flooring kind, not by a fragile name.
+/// Built-in wall and ceiling finishes added once to older plans. The `kind`
+/// is the shader/catalogue key, so custom finishes can reuse it.
+pub const FINISH_LIBRARY: [(FinishSurface, &str, f64, &str, &str); 6] = [
+    (FinishSurface::Wall, "墙面乳胶漆", 45.0, "paint", "#d0c9bc"),
+    (FinishSurface::Wall, "无纺布壁纸", 80.0, "wallpaper", "#c9c0b1"),
+    (FinishSurface::Wall, "木饰面", 380.0, "wood_panel", "#86664a"),
+    (FinishSurface::Wall, "墙砖", 220.0, "tile", "#b9c0bd"),
+    (FinishSurface::Ceiling, "顶面乳胶漆", 38.0, "paint", "#e8e6df"),
+    (FinishSurface::Ceiling, "顶面木饰面", 320.0, "wood_panel", "#7a614b"),
+];
+
+/// Seed the standard palette into a document that has no material library,
+/// then add the wall/ceiling presets once. The version lives in the document
+/// so a preset the user deletes is not recreated on the next open.
 pub fn ensure_materials(doc: &mut Document) {
-    for (index, (name, price, kind)) in MATERIAL_LIBRARY.into_iter().enumerate() {
-        if doc.materials.iter().any(|m| m.kind == kind) {
-            continue;
+    if doc.materials.is_empty() {
+        for (index, (name, price, kind, color)) in MATERIAL_LIBRARY.into_iter().enumerate() {
+            // Keep the historical 201..206 material ids for starter plans, but
+            // never reuse an id that a wall, room, opening or piece already owns.
+            let preferred = 201 + index as u128;
+            let id = if id_in_use(doc, preferred) {
+                doc.next_id()
+            } else {
+                preferred
+            };
+            doc.materials.push(Material {
+                id: EntityId(id),
+                name: name.into(),
+                price_per_m2: price,
+                kind: kind.into(),
+                color: color.into(),
+                surface: FinishSurface::Floor,
+                waste_rate: fp_model::default_waste_rate(),
+                built_in: true,
+            });
         }
-        // Keep the historical 201..206 material ids for starter plans, but
-        // never reuse an id that a wall, room, opening or piece already owns.
-        let preferred = 201 + index as u128;
+    }
+    ensure_finish_library(doc);
+}
+
+fn ensure_finish_library(doc: &mut Document) {
+    if doc.settings.finish_library_version >= 1 {
+        return;
+    }
+    for (index, (surface, name, price, kind, color)) in FINISH_LIBRARY.into_iter().enumerate() {
+        let preferred = 211 + index as u128;
         let id = if id_in_use(doc, preferred) {
             doc.next_id()
         } else {
@@ -276,8 +312,50 @@ pub fn ensure_materials(doc: &mut Document) {
             name: name.into(),
             price_per_m2: price,
             kind: kind.into(),
+            color: color.into(),
+            surface,
+            waste_rate: if surface == FinishSurface::Wall { 0.08 } else { 0.03 },
+            built_in: true,
         });
     }
+
+    // Old walls carried only the enum. Point them at the matching built-in so
+    // the inspector, 3D view and quote all read the same finish record.
+    let paint_wall = built_in_finish_id(doc, FinishSurface::Wall, "paint");
+    let wallpaper = built_in_finish_id(doc, FinishSurface::Wall, "wallpaper");
+    let wood_panel = built_in_finish_id(doc, FinishSurface::Wall, "wood_panel");
+    let tile = built_in_finish_id(doc, FinishSurface::Wall, "tile");
+    for wall in &mut doc.walls {
+        if wall.finish_id.is_some() {
+            continue;
+        }
+        wall.finish_id = match wall.finish {
+            WallFinish::Paint => paint_wall,
+            WallFinish::Wallpaper => wallpaper,
+            WallFinish::WoodPanel => wood_panel,
+            WallFinish::Tile => tile,
+        };
+    }
+    // Every room starts with the standard ceiling paint. This is what makes
+    // the ceiling line appear in the quote without asking users to click.
+    let ceiling_paint = built_in_finish_id(doc, FinishSurface::Ceiling, "paint");
+    for room in &mut doc.rooms {
+        if room.ceiling_material_id.is_none() {
+            room.ceiling_material_id = ceiling_paint;
+        }
+    }
+    doc.settings.finish_library_version = 1;
+}
+
+pub fn built_in_finish_id(
+    doc: &Document,
+    surface: FinishSurface,
+    kind: &str,
+) -> Option<EntityId> {
+    doc.materials
+        .iter()
+        .find(|m| m.built_in && m.surface == surface && m.kind == kind)
+        .map(|m| m.id)
 }
 
 fn id_in_use(doc: &Document, id: u128) -> bool {
@@ -287,6 +365,7 @@ fn id_in_use(doc: &Document, id: u128) -> bool {
         || doc.furniture.iter().any(|f| f.id.0 == id)
         || doc.materials.iter().any(|m| m.id.0 == id)
         || doc.measures.iter().any(|m| m.id.0 == id)
+        || doc.stairs.iter().any(|s| s.id.0 == id)
 }
 
 fn materials(doc: &mut Document) {
@@ -331,6 +410,7 @@ fn opening(
         sill_mm,
         swing_deg: if kind == OpeningKind::Door { 90.0 } else { 0.0 },
         hinge_right: false,
+        price: None,
     });
 }
 
@@ -341,6 +421,8 @@ fn room(doc: &mut Document, id: u128, points: &[(i32, i32)], name: &str, counted
         name: name.into(),
         material_id: Some(EntityId(201)),
         counted,
+        floor: 0,
+        ceiling_material_id: None,
     });
 }
 
@@ -366,6 +448,8 @@ fn furniture(
         rotation_deg,
         color: spec.color.to_owned(),
         room_id: Some(EntityId(room_id)),
+        price: None,
+        floor: 0,
     });
 }
 
@@ -404,6 +488,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn finish_library_migrates_old_walls_and_ceilings_once() {
+        let mut doc = Document::new("旧图");
+        doc.materials.push(Material {
+            id: EntityId(201),
+            name: "旧橡木".into(),
+            price_per_m2: 100.0,
+            kind: "wood".into(),
+            color: String::new(),
+            surface: FinishSurface::Floor,
+            waste_rate: 0.05,
+            built_in: true,
+        });
+        let mut wall = Wall::new(
+            EntityId(1),
+            Pt::new(0, 0),
+            Pt::new(3000, 0),
+            200,
+            WallKind::Partition,
+        );
+        wall.finish = WallFinish::Wallpaper;
+        doc.walls.push(wall);
+        doc.rooms.push(Room {
+            id: EntityId(2),
+            polygon: vec![
+                Pt::new(0, 0),
+                Pt::new(3000, 0),
+                Pt::new(3000, 3000),
+                Pt::new(0, 3000),
+            ],
+            name: "客厅".into(),
+            material_id: Some(EntityId(201)),
+            counted: true,
+            floor: 0,
+            ceiling_material_id: None,
+        });
+        assert_eq!(doc.settings.finish_library_version, 0);
+        ensure_materials(&mut doc);
+        assert_eq!(doc.settings.finish_library_version, 1);
+        let wall_finishes = doc
+            .materials
+            .iter()
+            .filter(|m| m.surface == FinishSurface::Wall)
+            .count();
+        let ceiling_finishes = doc
+            .materials
+            .iter()
+            .filter(|m| m.surface == FinishSurface::Ceiling)
+            .count();
+        assert_eq!(wall_finishes, 4);
+        assert_eq!(ceiling_finishes, 2);
+        let wallpaper_id = built_in_finish_id(&doc, FinishSurface::Wall, "wallpaper");
+        assert_eq!(doc.walls[0].finish_id, wallpaper_id);
+        let ceiling_id = built_in_finish_id(&doc, FinishSurface::Ceiling, "paint");
+        assert_eq!(doc.rooms[0].ceiling_material_id, ceiling_id);
+
+        // Once migrated, a manually deleted preset stays deleted.
+        let before = doc.materials.len();
+        doc.materials.retain(|m| m.kind != "wallpaper");
+        ensure_materials(&mut doc);
+        assert_eq!(doc.materials.len(), before - 1);
     }
 
     #[test]

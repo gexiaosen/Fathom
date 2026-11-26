@@ -39,7 +39,7 @@ impl OrbitCamera {
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y, aspect.max(0.1), 0.05, 500.0);
+        let proj = Mat4::perspective_rh(self.fov_y, aspect.max(0.1), 0.08, 1500.0);
         proj * view
     }
 
@@ -96,7 +96,7 @@ impl WalkCamera {
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         let view = Mat4::look_at_rh(self.pos, self.pos + self.dir(), Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y, aspect.max(0.1), 0.08, 400.0);
+        let proj = Mat4::perspective_rh(self.fov_y, aspect.max(0.1), 0.08, 1500.0);
         proj * view
     }
 

@@ -10,7 +10,9 @@ pub mod grid;
 mod openings;
 mod rooms;
 
-pub use batch::{Batch, Color, QuadVertex, build_wall_batch, build_wall_batch_visible};
+pub use batch::{
+    Batch, Color, QuadVertex, build_wall_batch, build_wall_batch_visible, build_wall_finish_batch,
+};
 pub use camera::Camera2D;
 pub use furniture::{build_furniture_batch, corners, hit};
 pub use grid::{GridLines, build_grid};

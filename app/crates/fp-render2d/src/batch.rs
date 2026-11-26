@@ -1,7 +1,8 @@
 //! Screen-space vertex batches for the plan view.
 
 use fp_core::{EntityId, Pt};
-use fp_model::{Wall, WallKind};
+use fp_model::catalog::{material_color, material_kind_color};
+use fp_model::{Material, Wall, WallFinish, WallKind};
 
 use crate::camera::Camera2D;
 
@@ -103,6 +104,69 @@ impl Batch {
     }
 }
 
+/// Plan walls tinted by the finish record each wall points at. Used by the
+/// construction sheets so a wall's colour is the same finish shown in A-03.
+pub fn build_wall_finish_batch(
+    walls: &[Wall],
+    materials: &[Material],
+    cam: &Camera2D,
+    show_bearing: bool,
+) -> Batch {
+    let mut batch = Batch {
+        vertices: Vec::with_capacity(walls.len() * 6),
+    };
+    for wall in walls {
+        let a = cam.world_to_screen(wall.start);
+        let b = cam.world_to_screen(wall.end);
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if len < 1e-3 {
+            continue;
+        }
+        let n = [-d[1] / len, d[0] / len];
+        let half = ((wall.thickness_mm as f32 * cam.scale as f32) * 0.5).max(MIN_WALL_PX * 0.5);
+        let rgb = wall
+            .finish_id
+            .and_then(|id| materials.iter().find(|m| m.id == id))
+            .map(material_color)
+            .unwrap_or_else(|| match wall.finish {
+                WallFinish::Paint => material_kind_color("paint"),
+                WallFinish::Wallpaper => material_kind_color("wallpaper"),
+                WallFinish::WoodPanel => material_kind_color("wood_panel"),
+                WallFinish::Tile => material_kind_color("tile"),
+            });
+        let color = if !show_bearing && wall.kind == WallKind::Bearing {
+            wall_color(WallKind::Partition)
+        } else {
+            Color([rgb[0], rgb[1], rgb[2], 0.84])
+        };
+        batch.push_quad(
+            [
+                [a[0] + n[0] * half, a[1] + n[1] * half],
+                [b[0] + n[0] * half, b[1] + n[1] * half],
+                [b[0] - n[0] * half, b[1] - n[1] * half],
+                [a[0] - n[0] * half, a[1] - n[1] * half],
+            ],
+            color,
+        );
+        // Keep the wall readable as a plan element: the finish tint alone can
+        // be too close to the paper or floor colours.
+        let off = (half / (cam.scale as f32).max(1e-6)).round() as i32;
+        for sign in [1.0f32, -1.0] {
+            let a_edge = Pt::new(
+                wall.start.x + (n[0] * off as f32 * sign) as i32,
+                wall.start.y + (n[1] * off as f32 * sign) as i32,
+            );
+            let b_edge = Pt::new(
+                wall.end.x + (n[0] * off as f32 * sign) as i32,
+                wall.end.y + (n[1] * off as f32 * sign) as i32,
+            );
+            batch.line(cam, a_edge, b_edge, 1.0, Color([0.24, 0.23, 0.21, 0.9]));
+        }
+    }
+    batch
+}
+
 /// Turn wall centrelines into screen-space quads.
 pub fn build_wall_batch(walls: &[Wall], selected: &[EntityId], cam: &Camera2D) -> Batch {
     build_wall_batch_visible(walls, selected, cam, true)
@@ -174,6 +238,49 @@ mod tests {
             sum += ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) * 0.5;
         }
         sum.abs()
+    }
+
+    #[test]
+    fn wall_quads_use_the_finish_record_colour() {
+        let cam = Camera2D::new([1000.0, 800.0]);
+        let materials = vec![
+            Material {
+                id: EntityId(201),
+                name: "red".to_string(),
+                price_per_m2: 0.0,
+                kind: "paint".to_string(),
+                color: "#ff0000".to_string(),
+                surface: fp_model::FinishSurface::Wall,
+                waste_rate: 0.0,
+                built_in: true,
+            },
+            Material {
+                id: EntityId(202),
+                name: "green".to_string(),
+                price_per_m2: 0.0,
+                kind: "tile".to_string(),
+                color: "#00ff00".to_string(),
+                surface: fp_model::FinishSurface::Wall,
+                waste_rate: 0.0,
+                built_in: true,
+            },
+        ];
+        let mut a = wall(120);
+        a.finish_id = Some(EntityId(201));
+        let mut b = wall(120);
+        b.id = EntityId(2);
+        b.start = Pt::new(0, 2000);
+        b.end = Pt::new(1000, 2000);
+        b.finish_id = Some(EntityId(202));
+        let batch = build_wall_finish_batch(&[a, b], &materials, &cam, true);
+        assert!(batch
+            .vertices
+            .iter()
+            .any(|v| v.color[0] == 1.0 && v.color[1] == 0.0));
+        assert!(batch
+            .vertices
+            .iter()
+            .any(|v| v.color[1] == 1.0 && v.color[0] == 0.0));
     }
 
     #[test]

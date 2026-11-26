@@ -79,6 +79,8 @@ mod tests {
             rotation_deg: 0.0,
             color: "#8b6f55".into(),
             room_id: None,
+            price: None,
+            floor: 0,
         }
     }
 

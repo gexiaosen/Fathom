@@ -8,9 +8,11 @@ mod export;
 mod favorites;
 mod i18n;
 mod import;
+mod quote;
 mod recent;
 mod render3d;
 mod scene;
+mod surface_detail;
 mod templates;
 mod text_input;
 mod underlay;
@@ -24,8 +26,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
-use fp_model::WallKind;
+use fp_core::EntityId;
 use fp_model::catalog::{CATALOG, FurnitureCategory, TABS};
+use fp_model::catalog::{material_color, parse_hex_color};
+use fp_model::{Material, RoofKind, RoofSettings, WallKind};
 use fp_render2d::Batch;
 use fp_ui::Tool;
 use glam::Mat4;
@@ -37,9 +41,9 @@ use scene::{
 use wgpui::{
     Animation, AnimationExt as _, AnyElement, App, Application, Bounds, Context, DragMoveEvent,
     Entity, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, TitlebarOptions,
-    WeakEntity, WgpuSurfaceHandle, Window, WindowBounds, WindowOptions, div, ease_out_quint,
-    prelude::*, px, rgb, rgba, size, svg, wgpu_surface,
+    MouseUpEvent, ObjectFit, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
+    TitlebarOptions, WeakEntity, WgpuSurfaceHandle, Window, WindowBounds, WindowOptions, div,
+    ease_out_quint, img, prelude::*, px, rgb, rgba, size, svg, wgpu_surface,
 };
 
 const VIEW_W: u32 = 1280;
@@ -120,6 +124,20 @@ struct PlanEditor {
     import_input: Entity<text_input::TextInput>,
     import_rx: Receiver<text_input::InputEvent>,
     import_path: Option<PathBuf>,
+    /// Detected document waiting for the user to accept the preview.
+    import_preview: Option<import::ImportOutcome>,
+    import_preview_png: Option<PathBuf>,
+    quote_open: bool,
+    floor_open: bool,
+    floor_inputs: [Entity<text_input::TextInput>; 2],
+    floor_rx: Receiver<text_input::InputEvent>,
+    material_scroll: usize,
+    quote_inputs: [Entity<text_input::TextInput>; 4],
+    quote_rx: Receiver<text_input::InputEvent>,
+    materials_open: bool,
+    material_edit: Option<fp_core::EntityId>,
+    material_inputs: [Entity<text_input::TextInput>; 5],
+    material_rx: Receiver<text_input::InputEvent>,
     library_open: bool,
     library_input: Entity<text_input::TextInput>,
     library_rx: Receiver<text_input::InputEvent>,
@@ -130,6 +148,13 @@ struct PlanEditor {
     /// Right inspector / 3D panel visibility; `]` collapses it like the web
     /// original's property-panel shortcut.
     right_open: bool,
+    /// 3D view settings panel. Separated from the inspector so closing one
+    /// does not make the other unreachable.
+    view3d_open: bool,
+    /// Selection signature when the user last closed the inspector. A new
+    /// selection clears the collapse and reopens the panel.
+    inspector_signature: Option<u64>,
+    inspector_collapsed: bool,
     more_open: bool,
     export_open: bool,
     scale_open: bool,
@@ -167,20 +192,21 @@ impl PlanEditor {
     /// Floating panels, rails and status chips sit above the wgpu surface, but
     /// GPUI bubbles their mouse events to this root. Reject those points before
     /// they reach the plan so a button click never also selects or places.
-    fn pointer_over_chrome(&self, pos: [f32; 2], view: ViewMode) -> bool {
+    fn pointer_over_chrome(&self, pos: [f32; 2], view: ViewMode, lang: i18n::Lang) -> bool {
         let [w, h] = self.viewport;
-        if self.help_open || self.update_open {
+        if self.help_open || self.update_open || self.quote_open || self.materials_open {
             return true;
         }
         if pos[1] < 48.0 {
             return true; // titlebar drag strip and floating top chrome
         }
-        // Left icon rail. It ends at ~460px on an 800px window.
-        if pos[0] <= 66.0 && pos[1] <= 470.0 {
+        // Left icon rail. English labels need a slightly wider rail.
+        let rail_right = if lang == i18n::Lang::En { 74.0 } else { 66.0 };
+        if pos[0] <= rail_right && pos[1] <= 470.0 {
             return true;
         }
         // Two small bottom clusters instead of the old full-width bar.
-        if pos[0] <= 105.0 && pos[1] >= h - 52.0 {
+        if pos[0] <= 260.0 && pos[1] >= h - 52.0 {
             return true;
         }
         if pos[0] >= w - 220.0 && pos[1] >= h - 52.0 {
@@ -193,7 +219,7 @@ impl PlanEditor {
         if self.more_open && pos[0] >= w - 250.0 && pos[1] <= 310.0 {
             return true;
         }
-        if self.export_open && pos[0] >= w - 290.0 && pos[1] <= 310.0 {
+        if self.export_open && pos[0] >= w - 380.0 && pos[1] <= 340.0 {
             return true;
         }
         if self.library_open && pos[0] <= 334.0 && pos[1] >= 96.0 && pos[1] <= 700.0 {
@@ -211,11 +237,13 @@ impl PlanEditor {
                 }
             }
             ViewMode::Three => {
-                // The 3D lighting panel sits to the right of the icon rail.
-                if pos[0] <= 300.0 && pos[1] <= 680.0 {
+                // The 3D panel is flush with the left edge; the rest of the
+                // canvas must stay free for orbiting, so do not reserve the
+                // old icon-rail width.
+                if pos[0] <= 250.0 && pos[1] <= 680.0 && self.view3d_open {
                     return true;
                 }
-                if self.right_open && pos[0] >= w - 292.0 && pos[1] <= 620.0 {
+                if pos[0] <= 130.0 && pos[1] <= 100.0 && !self.view3d_open {
                     return true;
                 }
             }
@@ -238,6 +266,7 @@ impl PlanEditor {
         if self.new_menu_open
             || self.project_open
             || self.import_open
+            || self.quote_open
             || self.help_open
             || self.update_open
             || self.inspector_edit.is_some()
@@ -253,11 +282,16 @@ impl PlanEditor {
         };
         let shift = ev.modifiers.shift;
         let mut state = self.state.lock().unwrap();
-        let over_chrome = self.pointer_over_chrome(pos, state.view);
+        let over_chrome = self.pointer_over_chrome(pos, state.view, state.lang);
         state.set_pointer_over_ui(over_chrome);
         if over_chrome {
             return;
         }
+        // A click on the canvas is an explicit request to see the selected
+        // object again, even if the user closed the same inspector a moment
+        // ago. This covers "click the same wall twice" as well as reselecting
+        // a different object.
+        self.inspector_collapsed = false;
         state.pointer_down(pos, button, shift);
         drop(state);
         self.more_open = false;
@@ -270,6 +304,7 @@ impl PlanEditor {
         if self.new_menu_open
             || self.project_open
             || self.import_open
+            || self.quote_open
             || self.help_open
             || self.update_open
             || self.inspector_edit.is_some()
@@ -285,7 +320,7 @@ impl PlanEditor {
         }
         let shift = ev.modifiers.shift;
         let mut state = self.state.lock().unwrap();
-        let over_chrome = self.pointer_over_chrome(pos, state.view);
+        let over_chrome = self.pointer_over_chrome(pos, state.view, state.lang);
         state.set_pointer_over_ui(over_chrome);
         if over_chrome && !state.pointer_captured() {
             return;
@@ -298,6 +333,7 @@ impl PlanEditor {
         if self.new_menu_open
             || self.project_open
             || self.import_open
+            || self.quote_open
             || self.help_open
             || self.update_open
             || self.inspector_edit.is_some()
@@ -314,7 +350,7 @@ impl PlanEditor {
         let shift = ev.modifiers.shift;
         {
             let mut state = self.state.lock().unwrap();
-            let over_chrome = self.pointer_over_chrome(pos, state.view);
+            let over_chrome = self.pointer_over_chrome(pos, state.view, state.lang);
             state.set_pointer_over_ui(over_chrome);
             state.clear_walk_stick();
             if over_chrome && !state.pointer_captured() {
@@ -331,6 +367,7 @@ impl PlanEditor {
         if self.new_menu_open
             || self.project_open
             || self.import_open
+            || self.quote_open
             || self.inspector_edit.is_some()
         {
             return;
@@ -340,6 +377,15 @@ impl PlanEditor {
             ScrollDelta::Pixels(p) => f32::from(p.y),
             ScrollDelta::Lines(l) => l.y * 20.0,
         };
+        if self.materials_open && dy != 0.0 {
+            let total = self.state.lock().unwrap().doc.materials.len();
+            let step = if dy > 0.0 { -1 } else { 1 };
+            let max = total.saturating_sub(MATERIAL_ROWS);
+            self.material_scroll =
+                (self.material_scroll as i32 + step).clamp(0, max as i32) as usize;
+            cx.notify();
+            return;
+        }
         if self.library_open && pos[0] >= 98.0 && pos[0] <= 306.0 && pos[1] >= 52.0 {
             let category = self.state.lock().unwrap().catalog_filter;
             let total = catalog_visible_count(
@@ -353,8 +399,11 @@ impl PlanEditor {
             self.library_scroll = (self.library_scroll as i32 + step).clamp(0, max as i32) as usize;
             return;
         }
-        let view = self.state.lock().unwrap().view;
-        if self.pointer_over_chrome(pos, view) {
+        let (view, lang) = {
+            let state = self.state.lock().unwrap();
+            (state.view, state.lang)
+        };
+        if self.pointer_over_chrome(pos, view, lang) {
             return;
         }
         self.state.lock().unwrap().scroll(pos, dy);
@@ -377,6 +426,28 @@ impl PlanEditor {
         if self.help_open {
             if key == "escape" {
                 self.help_open = false;
+                cx.notify();
+            }
+            return;
+        }
+        if self.materials_open {
+            if key == "escape" {
+                self.close_materials(window, cx);
+            }
+            return;
+        }
+        if self.floor_open {
+            if key == "escape" {
+                self.floor_open = false;
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
+            return;
+        }
+        if self.quote_open {
+            if key == "escape" {
+                self.quote_open = false;
+                window.focus(&self.focus, cx);
                 cx.notify();
             }
             return;
@@ -443,8 +514,13 @@ impl PlanEditor {
                 if self.library_open {
                     self.layers_open = false;
                 }
+            } else if self.state.lock().unwrap().view == ViewMode::Three {
+                self.view3d_open = !self.view3d_open;
             } else {
                 self.right_open = !self.right_open;
+                if self.right_open {
+                    self.inspector_collapsed = false;
+                }
             }
             cx.notify();
             return;
@@ -522,12 +598,18 @@ impl PlanEditor {
                 InspectorEdit::FurnitureDepth => Some(InspectorAction::FurnitureSetDepth(value)),
                 InspectorEdit::FurnitureX => Some(InspectorAction::FurnitureSetX(value)),
                 InspectorEdit::FurnitureY => Some(InspectorAction::FurnitureSetY(value)),
+                InspectorEdit::FurniturePrice => Some(InspectorAction::FurnitureSetPrice(value)),
                 InspectorEdit::WallLength => Some(InspectorAction::WallSetLength(value)),
                 InspectorEdit::WallThickness => Some(InspectorAction::WallSetThickness(value)),
                 InspectorEdit::WallHeight => Some(InspectorAction::WallSetHeight(value)),
                 InspectorEdit::OpeningWidth => Some(InspectorAction::OpeningSetWidth(value)),
                 InspectorEdit::OpeningHeight => Some(InspectorAction::OpeningSetHeight(value)),
                 InspectorEdit::OpeningSill => Some(InspectorAction::OpeningSetSill(value)),
+                InspectorEdit::OpeningPrice => Some(InspectorAction::OpeningSetPrice(value)),
+                InspectorEdit::StairWidth => Some(InspectorAction::StairSetWidth(value)),
+                InspectorEdit::StairSteps => {
+                    Some(InspectorAction::StairSetSteps(value.max(0) as u32))
+                }
             };
             if let Some(action) = action {
                 self.state.lock().unwrap().apply_action(action);
@@ -587,12 +669,14 @@ impl PlanEditor {
         self.scale_open = false;
         self.wall_kind_open = false;
         let picked = rfd::FileDialog::new()
-            .add_filter("户型图", &["png", "jpg", "jpeg"])
+            .add_filter("户型图 / DXF", &["png", "jpg", "jpeg", "dxf"])
             .pick_file();
         let Some(path) = picked else {
             return;
         };
         self.import_path = Some(path);
+        self.import_preview = None;
+        self.import_preview_png = None;
         self.import_input
             .update(cx, |input, cx| input.set_text("12000", cx));
         self.import_open = true;
@@ -601,13 +685,14 @@ impl PlanEditor {
         cx.notify();
     }
 
-    fn confirm_import(&mut self, recognize: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Decode/detect once and show the result before touching the current plan.
+    fn prepare_import(&mut self, recognize: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.import_path.clone() else {
             return;
         };
         let raw = self.import_input.read(cx).text();
         let width_mm: i32 = raw.trim().parse().unwrap_or(0);
-        if !(1_000..=100_000).contains(&width_mm) {
+        if !import::is_dxf(&path) && !(1_000..=100_000).contains(&width_mm) {
             self.state.lock().unwrap().note = Some("图纸宽度需在 1000–100000 mm 之间".into());
             cx.notify();
             return;
@@ -616,21 +701,16 @@ impl PlanEditor {
             .file_stem()
             .map(|s| format!("{} 户型", s.to_string_lossy()))
             .unwrap_or_else(|| "导入户型".into());
-        match import::import_floorplan(&path, width_mm, &name, recognize) {
+        let outcome = if import::is_dxf(&path) {
+            import::import_dxf(&path, &name)
+        } else {
+            import::import_floorplan(&path, width_mm, &name, recognize)
+        };
+        match outcome {
             Ok(outcome) => {
-                let count = outcome.recognized_walls;
-                let project = scene::next_project_path(&name);
-                {
-                    let mut state = self.state.lock().unwrap();
-                    state.new_document(outcome.doc, project);
-                    state.note = Some(if recognize {
-                        format!("已导入底图 · 识别 {count} 段墙，请核对后补门窗")
-                    } else {
-                        "已导入底图 · 可直接描图".into()
-                    });
-                }
-                self.import_open = false;
-                self.import_path = None;
+                self.import_preview_png = Some(outcome.preview_png.clone());
+                self.import_preview = Some(outcome);
+                self.state.lock().unwrap().note = None;
                 window.focus(&self.focus, cx);
                 cx.notify();
             }
@@ -641,9 +721,53 @@ impl PlanEditor {
         }
     }
 
+    fn commit_import_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(outcome) = self.import_preview.take() else {
+            return;
+        };
+        let count = outcome.recognized_walls;
+        let rooms = outcome.recognized_rooms;
+        let doors = outcome.recognized_doors;
+        let vector = outcome.vector;
+        let name = self
+            .import_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{} 户型", s.to_string_lossy()))
+            .unwrap_or_else(|| "导入户型".into());
+        let project = scene::next_project_path(&name);
+        {
+            let mut state = self.state.lock().unwrap();
+            state.new_document(outcome.doc, project);
+            state.note = Some(if vector {
+                format!("已导入 DXF · {count} 段墙、{rooms} 个房间、{doors} 个门洞，请核对")
+            } else if count > 0 {
+                format!("已识别 {count} 段墙、{rooms} 个房间、{doors} 个门洞，请核对后补门窗")
+            } else {
+                "已导入底图 · 可直接描图".into()
+            });
+        }
+        self.import_open = false;
+        self.import_path = None;
+        self.import_preview = None;
+        self.import_preview_png = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn reset_import_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.import_preview = None;
+        self.import_preview_png = None;
+        let handle = self.import_input.read(cx).handle();
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
     fn close_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.import_open = false;
         self.import_path = None;
+        self.import_preview = None;
+        self.import_preview_png = None;
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -682,6 +806,292 @@ impl PlanEditor {
             export::print_plan(&state)
         };
         self.state.lock().unwrap().note = Some(outcome);
+        cx.notify();
+    }
+
+    fn set_floor_fields(&mut self, name: &str, height: i32, cx: &mut Context<Self>) {
+        let values = [name.to_string(), height.to_string()];
+        for (input, value) in self.floor_inputs.iter().zip(values) {
+            input.update(cx, |field, cx| field.set_text(&value, cx));
+        }
+        cx.notify();
+    }
+
+    fn save_floor_info(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.floor_inputs[0].read(cx).text().trim().to_string();
+        let raw_height = self.floor_inputs[1].read(cx).text().trim().to_string();
+        let Ok(height) = raw_height.parse::<i32>() else {
+            self.state.lock().unwrap().note = Some("层高需为整数毫米".into());
+            cx.notify();
+            return;
+        };
+        match self
+            .state
+            .lock()
+            .unwrap()
+            .set_active_level_info(&name, height)
+        {
+            Ok(()) => {
+                self.floor_open = false;
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
+            Err(message) => {
+                self.state.lock().unwrap().note = Some(message);
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_floor_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (name, height) = self.state.lock().unwrap().active_level_info();
+        self.set_floor_fields(&name, height, cx);
+        self.floor_open = true;
+        self.more_open = false;
+        self.export_open = false;
+        self.scale_open = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn choose_level(&mut self, level: usize, cx: &mut Context<Self>) {
+        let (name, height) = {
+            let mut state = self.state.lock().unwrap();
+            state.set_level(level);
+            state.active_level_info()
+        };
+        self.set_floor_fields(&name, height, cx);
+        self.floor_open = false;
+        cx.notify();
+    }
+
+    fn open_materials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.materials_open = true;
+        self.more_open = false;
+        self.export_open = false;
+        self.scale_open = false;
+        let first = {
+            let state = self.state.lock().unwrap();
+            state.doc.materials.first().map(|m| m.id)
+        };
+        self.select_material_edit(first, window, cx);
+    }
+
+    fn close_materials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.materials_open = false;
+        self.material_edit = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn select_material_edit(
+        &mut self,
+        id: Option<fp_core::EntityId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.material_edit = id;
+        let material = id.and_then(|id| self.state.lock().unwrap().material(id).cloned());
+        let values = if let Some(m) = material {
+            [
+                m.name.clone(),
+                format!("{:.2}", m.price_per_m2),
+                m.kind.clone(),
+                m.color.clone(),
+                match m.surface {
+                    fp_model::FinishSurface::Floor => "floor",
+                    fp_model::FinishSurface::Wall => "wall",
+                    fp_model::FinishSurface::Ceiling => "ceiling",
+                }
+                .to_string(),
+            ]
+        } else {
+            [
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "floor".to_string(),
+            ]
+        };
+        for (input, value) in self.material_inputs.iter().zip(values) {
+            input.update(cx, |field, cx| field.set_text(&value, cx));
+        }
+        let handle = self.material_inputs[0].read(cx).handle();
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn add_material(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.state.lock().unwrap().add_material();
+        self.select_material_edit(Some(id), window, cx);
+    }
+
+    fn save_material_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.material_edit else {
+            return;
+        };
+        let name = self.material_inputs[0].read(cx).text().trim().to_string();
+        if name.is_empty() {
+            self.state.lock().unwrap().note = Some("材料名称不能为空".into());
+            cx.notify();
+            return;
+        }
+        let price_raw = self.material_inputs[1].read(cx).text();
+        let Ok(price) = price_raw.trim().parse::<f64>() else {
+            self.state.lock().unwrap().note = Some("单价需为数字".into());
+            cx.notify();
+            return;
+        };
+        if price < 0.0 || !price.is_finite() {
+            self.state.lock().unwrap().note = Some("单价不能为负".into());
+            cx.notify();
+            return;
+        }
+        let kind_raw = self.material_inputs[2].read(cx).text();
+        let kind = if kind_raw.trim().is_empty() {
+            "stone".to_string()
+        } else {
+            kind_raw.trim().to_ascii_lowercase()
+        };
+        let color_raw = self.material_inputs[3].read(cx).text().trim().to_string();
+        let color = if color_raw.is_empty() {
+            String::new()
+        } else {
+            let normalized = if color_raw.starts_with('#') {
+                color_raw.clone()
+            } else {
+                format!("#{color_raw}")
+            };
+            if parse_hex_color(&normalized).is_none() {
+                self.state.lock().unwrap().note = Some("颜色需为 #RRGGBB".into());
+                cx.notify();
+                return;
+            }
+            normalized
+        };
+        let surface_raw = self.material_inputs[4].read(cx).text();
+        let Some(surface) = fp_model::FinishSurface::parse(&surface_raw) else {
+            self.state.lock().unwrap().note =
+                Some("适用面需为 floor / wall / ceiling".into());
+            cx.notify();
+            return;
+        };
+        let existing = self.state.lock().unwrap().material(id).cloned();
+        let after = Material {
+            id,
+            name,
+            price_per_m2: price,
+            kind,
+            color,
+            surface,
+            waste_rate: existing
+                .as_ref()
+                .map(|m| m.waste_rate)
+                .unwrap_or_else(fp_model::default_waste_rate),
+            built_in: existing.map(|m| m.built_in).unwrap_or(false),
+        };
+        self.state.lock().unwrap().update_material(after);
+        cx.notify();
+    }
+
+    fn delete_material_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.material_edit else {
+            return;
+        };
+        let before = self.state.lock().unwrap().doc.materials.len();
+        self.state.lock().unwrap().remove_material(id);
+        let after = self.state.lock().unwrap().doc.materials.len();
+        if after < before {
+            let first = self
+                .state
+                .lock()
+                .unwrap()
+                .doc
+                .materials
+                .first()
+                .map(|m| m.id);
+            self.select_material_edit(first, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn open_quote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = self.state.lock().unwrap().quote_settings();
+        let values = [
+            format!("{:.0}", settings.labor_per_m2),
+            format!("{:.0}", settings.auxiliary_per_m2),
+            format!("{:.2}", settings.tax_rate * 100.0),
+            format!("{:.2}", settings.discount_rate * 100.0),
+        ];
+        for (input, value) in self.quote_inputs.iter().zip(values) {
+            input.update(cx, |field, cx| field.set_text(&value, cx));
+        }
+        self.quote_open = true;
+        self.more_open = false;
+        self.export_open = false;
+        self.scale_open = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn close_quote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quote_open = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    fn apply_quote_settings(&mut self, cx: &mut Context<Self>) {
+        let values = [
+            self.quote_inputs[0].read(cx).text(),
+            self.quote_inputs[1].read(cx).text(),
+            self.quote_inputs[2].read(cx).text(),
+            self.quote_inputs[3].read(cx).text(),
+        ];
+        let parse = |text: &str, fallback: f64| {
+            text.trim()
+                .trim_end_matches('%')
+                .parse::<f64>()
+                .unwrap_or(fallback)
+        };
+        let settings = self.state.lock().unwrap().quote_settings();
+        let labor = parse(&values[0], settings.labor_per_m2);
+        let auxiliary = parse(&values[1], settings.auxiliary_per_m2);
+        let tax = parse(&values[2], settings.tax_rate * 100.0) / 100.0;
+        let discount = parse(&values[3], settings.discount_rate * 100.0) / 100.0;
+        self.state
+            .lock()
+            .unwrap()
+            .update_quote_settings(labor, auxiliary, tax, discount);
+        cx.notify();
+    }
+
+    fn export_quote(&mut self, extension: &'static str, cx: &mut Context<Self>) {
+        let (filter, filename) = match extension {
+            "xlsx" => ("XLSX", "quote.xlsx"),
+            "pdf" => ("PDF", "quote.pdf"),
+            _ => ("CSV", "quote.csv"),
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(filter, &[extension])
+            .set_file_name(filename)
+            .save_file()
+        else {
+            return;
+        };
+        let outcome = {
+            let state = self.state.lock().unwrap();
+            match extension {
+                "xlsx" => export::export_quote_xlsx(&state, &path),
+                "pdf" => export::export_quote_pdf(&state, &path),
+                _ => export::export_quote_csv(&state, &path),
+            }
+        };
+        self.state.lock().unwrap().note = Some(match outcome {
+            Ok(msg) => msg,
+            Err(err) => format!("导出失败 · {err}"),
+        });
         cx.notify();
     }
 
@@ -858,8 +1268,33 @@ impl Render for PlanEditor {
         }
         while let Ok(ev) = self.import_rx.try_recv() {
             match ev {
-                text_input::InputEvent::Submit(_) => self.confirm_import(true, window, cx),
+                text_input::InputEvent::Submit(_) => self.prepare_import(true, window, cx),
                 text_input::InputEvent::Cancel => self.close_import(window, cx),
+                text_input::InputEvent::Changed(_) => {}
+            }
+        }
+        while let Ok(ev) = self.floor_rx.try_recv() {
+            match ev {
+                text_input::InputEvent::Submit(_) => self.save_floor_info(window, cx),
+                text_input::InputEvent::Cancel => {
+                    self.floor_open = false;
+                    window.focus(&self.focus, cx);
+                    cx.notify();
+                }
+                text_input::InputEvent::Changed(_) => {}
+            }
+        }
+        while let Ok(ev) = self.quote_rx.try_recv() {
+            match ev {
+                text_input::InputEvent::Submit(_) => self.apply_quote_settings(cx),
+                text_input::InputEvent::Cancel => self.close_quote(window, cx),
+                text_input::InputEvent::Changed(_) => {}
+            }
+        }
+        while let Ok(ev) = self.material_rx.try_recv() {
+            match ev {
+                text_input::InputEvent::Submit(_) => self.save_material_edit(cx),
+                text_input::InputEvent::Cancel => self.close_materials(window, cx),
                 text_input::InputEvent::Changed(_) => {}
             }
         }
@@ -919,8 +1354,11 @@ impl Render for PlanEditor {
             dirty,
             plan_area,
             cutaway,
+            show_roof,
+            roof_settings,
             night,
             sun,
+            inspector_signature,
         ) = {
             let s = self.state.lock().unwrap();
             (
@@ -941,10 +1379,28 @@ impl Render for PlanEditor {
                 s.is_dirty(),
                 s.quote_totals().net_area,
                 s.cutaway,
+                s.show_roof,
+                s.roof_settings(),
                 s.night,
                 s.sun,
+                s.selection_signature(),
             )
         };
+        // Reopen the inspector when the selection actually changes. Closing the
+        // same panel does not permanently disarm it: click another wall (or
+        // deselect and select again) and the details come back.
+        if inspector.is_some() && self.inspector_signature != Some(inspector_signature) {
+            self.inspector_collapsed = false;
+            self.right_open = true;
+        }
+        if inspector.is_none() {
+            self.inspector_collapsed = false;
+        }
+        self.inspector_signature = Some(inspector_signature);
+        self.inspector_shown = self.right_open
+            && !self.inspector_collapsed
+            && view != ViewMode::Three
+            && inspector.is_some();
         if let Some(msg) = note.clone() {
             if !self.toast_visible || self.toast_msg.as_deref() != Some(msg.as_str()) {
                 self.toast_gen = self.toast_gen.wrapping_add(1);
@@ -983,6 +1439,10 @@ impl Render for PlanEditor {
             None
         };
         let t = i18n::T(lang);
+        // English tool names ("Window", "Demol.", "Layers") are wider than the
+        // two-character Chinese labels; a slightly wider rail keeps every
+        // label on one line inside the 43 pt rail buttons.
+        let rail_width = if lang == i18n::Lang::En { 56.0 } else { 48.0 };
         let title = if doc_name.trim().is_empty() {
             "Fathom 方寸".to_string()
         } else {
@@ -1000,6 +1460,19 @@ impl Render for PlanEditor {
         let inspector_input = self.inspector_input.clone();
         let import_open = self.import_open;
         let import_input = self.import_input.clone();
+        let import_preview = self.import_preview.as_ref().map(|outcome| {
+            (
+                outcome.preview_png.clone(),
+                outcome.recognized_walls,
+                outcome.recognized_rooms,
+                outcome.recognized_doors,
+                outcome.vector,
+            )
+        });
+        let quote_open = self.quote_open;
+        let floor_open = self.floor_open;
+        let floor_inputs = self.floor_inputs.clone();
+        let quote_inputs = self.quote_inputs.clone();
         let import_name = self
             .import_path
             .as_ref()
@@ -1012,8 +1485,10 @@ impl Render for PlanEditor {
         let library_favorites = self.favorites.clone();
         let favorites_only = self.favorites_only;
         let layers_open = self.layers_open;
-        let right_open = self.right_open;
+        let view3d_open = self.view3d_open;
         let more_open = self.more_open;
+        let materials_open = self.materials_open;
+        let material_edit = self.material_edit;
         let export_open = self.export_open;
         let scale_open = self.scale_open;
         let wall_kind_open = self.wall_kind_open;
@@ -1021,7 +1496,26 @@ impl Render for PlanEditor {
         let update_open = self.update_open;
         let update_phase = self.update_phase.clone();
         let update_available = self.update_available.clone();
-        self.inspector_shown = right_open && inspector.is_some();
+        let (quote_summary, project_name, plan_empty, floor_name, floor_rows, floor_total) = {
+            let state = self.state.lock().unwrap();
+            let active = state.floor_index();
+            (
+                quote::Quote::compute(&state.doc),
+                state.doc.meta.name.clone(),
+                state.doc.walls.is_empty()
+                    && state.doc.rooms.is_empty()
+                    && state.doc.underlay.is_none(),
+                state.floor_name(),
+                state
+                    .doc
+                    .levels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, level)| (i, level.name.clone(), level.height_mm, i == active))
+                    .collect::<Vec<_>>(),
+                state.doc.level_count(),
+            )
+        };
 
         let rooms3d = if view == ViewMode::Three {
             self.state
@@ -1034,6 +1528,34 @@ impl Render for PlanEditor {
         } else {
             Vec::new()
         };
+        let quote_total_text = quote::money(quote_summary.total);
+        let material_rows = {
+            let state = self.state.lock().unwrap();
+            let mut rows = state
+                .doc
+                .materials
+                .iter()
+                .map(|m| {
+                    (
+                        m.clone(),
+                        state.material_usage(m.id),
+                        state.material_usage_info(m.id).1,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by_key(|(m, _, _)| (surface_rank(m.surface), m.name.clone()));
+            rows
+        };
+        let modal_open = self.new_menu_open
+            || self.project_open
+            || self.import_open
+            || self.help_open
+            || self.update_open
+            || self.inspector_edit.is_some()
+            || self.quote_open
+            || self.floor_open
+            || self.materials_open;
+        self.state.lock().unwrap().modal_clear = modal_open;
         let (layer_flags, measure_count, furniture_count) = {
             let state = self.state.lock().unwrap();
             (
@@ -1098,7 +1620,7 @@ impl Render for PlanEditor {
             .on_drop(cx.listener(|this, data: &FurnitureDrag, _window, cx| {
                 if let Some(pos) = this.drag_pos.take() {
                     let mut state = this.state.lock().unwrap();
-                    if !this.pointer_over_chrome(pos, state.view) {
+                    if !this.pointer_over_chrome(pos, state.view, state.lang) {
                         state.place_furniture_at(data.index, pos);
                     }
                 }
@@ -1130,7 +1652,37 @@ impl Render for PlanEditor {
                     .items_center()
                     .gap(px(12.0))
                     .child(brand_badge())
-                    .child(doc_chip(doc_name.clone(), plan_area, lang, cx)),
+                    .child(doc_chip(doc_name.clone(), plan_area, lang, cx))
+                    .child(floor_chip(floor_name.clone(), floor_total, lang, cx))
+                    .when(plan_empty, |el| {
+                        let empty_weak = cx.entity().downgrade();
+                        el.child(
+                            div()
+                                .h(px(28.0))
+                                .px(px(9.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(rgba(ACCENT_LINE))
+                                .bg(rgba(0xffffffd9))
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0xffffff)))
+                                .child(ui_icon(ICON_EXPORT, 11.0, ACCENT))
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(ACCENT))
+                                        .child(t.s("导入户型图 / DXF", "Import plan / DXF")),
+                                )
+                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                    if let Some(entity) = empty_weak.upgrade() {
+                                        entity.update(cx, |this, cx| this.pick_import(window, cx));
+                                    }
+                                }),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1203,6 +1755,7 @@ impl Render for PlanEditor {
                             .bg(rgba(CHROME_BORDER)),
                     )
                     .child(save_chrome_button(dirty, cx))
+                    .child(quote_chrome_button(quote_open, cx))
                     .child(chrome_button(ICON_EXPORT, export_open, cx, chrome_export))
                     .child(chrome_button_with_badge(
                         ICON_MORE,
@@ -1226,7 +1779,7 @@ impl Render for PlanEditor {
                     .absolute()
                     .top(px(62.0))
                     .left(px(14.0))
-                    .w(px(48.0))
+                    .w(px(rail_width))
                     .p(px(5.0))
                     .rounded(px(14.0))
                     .bg(rgba(CHROME_BG))
@@ -1262,6 +1815,13 @@ impl Render for PlanEditor {
                         t.s("窗", "Window"),
                         Tool::Window,
                         tool == Tool::Window,
+                        cx,
+                    ))
+                    .child(tool_button(
+                        ICON_STAIR,
+                        t.s("楼梯", "Stair"),
+                        Tool::Stair,
+                        tool == Tool::Stair,
                         cx,
                     ))
                     .child(library_button(
@@ -1304,8 +1864,8 @@ impl Render for PlanEditor {
                     .absolute()
                     .top(px(62.0))
                     .right(px(14.0))
-                    .children(if right_open {
-                        inspector.map(|view| inspector_panel(view, wall_kind_open, cx))
+                    .children(if self.inspector_shown {
+                        inspector.map(|view| inspector_panel(view, wall_kind_open, lang, cx))
                     } else {
                         None
                     }),
@@ -1445,8 +2005,54 @@ impl Render for PlanEditor {
             } else {
                 div().into_any_element()
             })
-            .child(if view == ViewMode::Three && right_open {
-                view3d_panel(rooms3d, cutaway, night, sun, lang, cx)
+            .child(if view == ViewMode::Three && view3d_open {
+                view3d_panel(
+                    rooms3d,
+                    cutaway,
+                    show_roof,
+                    roof_settings,
+                    night,
+                    sun,
+                    lang,
+                    cx,
+                )
+            } else {
+                div().into_any_element()
+            })
+            // When the 3D settings panel is collapsed, keep a small handle at
+            // the same left edge. Previously the only way back was the `]`
+            // shortcut, which looked like "sometimes it will not open".
+            .child(if view == ViewMode::Three && !view3d_open {
+                let weak = cx.entity().downgrade();
+                div()
+                    .absolute()
+                    .top(px(62.0))
+                    .left(px(14.0))
+                    .h(px(30.0))
+                    .px(px(10.0))
+                    .rounded(px(9.0))
+                    .bg(rgba(CHROME_BG))
+                    .border_1()
+                    .border_color(rgba(CHROME_BORDER))
+                    .shadow_sm()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(10.5))
+                    .text_color(rgb(PANEL_TEXT))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(0x23283312)))
+                    .child(ui_icon(ICON_LAYERS, 13.0, PANEL_MUTED))
+                    .child(t.s("3D 设置", "3D settings"))
+                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                        if let Some(entity) = weak.upgrade() {
+                            entity.update(cx, |this, cx| {
+                                this.view3d_open = true;
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element()
             } else {
                 div().into_any_element()
             })
@@ -1512,6 +2118,47 @@ impl Render for PlanEditor {
                 })
             })
             // ------------------------------------------------------------------
+            // Bottom-left quote chip: the price is visible without opening the
+            // inspector, and clicking it opens the whole-home breakdown.
+            .when(view == ViewMode::Plan, |el| {
+                let quote_weak = cx.entity().downgrade();
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom(px(14.0))
+                        .left(px(106.0))
+                        .h(px(30.0))
+                        .px(px(9.0))
+                        .rounded(px(9.0))
+                        .bg(rgba(CHROME_BG))
+                        .border_1()
+                        .border_color(rgba(CHROME_BORDER))
+                        .shadow_sm()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgba(0x23283312)))
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(rgb(PANEL_MUTED))
+                                .child(SharedString::from("全屋")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(wgpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(PANEL_TEXT))
+                                .child(SharedString::from(quote_total_text.clone())),
+                        )
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(entity) = quote_weak.upgrade() {
+                                entity.update(cx, |this, cx| this.open_quote(window, cx));
+                            }
+                        }),
+                )
+            })
             // Bottom-right: view, live fps, help. A compact pill pairs with the
             // scale pill instead of stretching a full-width status bar.
             .child(
@@ -1607,7 +2254,7 @@ impl Render for PlanEditor {
                         .absolute()
                         .top(px(46.0))
                         .right(px(76.0))
-                        .w(px(208.0))
+                        .w(px(300.0))
                         .rounded(px(13.0))
                         .bg(rgba(CHROME_BG))
                         .border_1()
@@ -1659,8 +2306,10 @@ impl Render for PlanEditor {
                                 .py(px(4.0))
                                 .flex()
                                 .flex_col()
+                                .child(quote_menu_button(lang, cx))
                                 .child(export_button(lang, cx))
                                 .child(export_pdf_button(lang, cx))
+                                .child(export_construction_button(lang, cx))
                                 .child(export_svg_button(lang, cx))
                                 .child(export_bom_button(lang, cx))
                                 .child(export_3d_button(lang, cx)),
@@ -1677,6 +2326,7 @@ impl Render for PlanEditor {
             // theme intentionally live elsewhere to avoid duplicate entry points.
             .when(more_open, |el| {
                 let lang_toggle = more_weak.clone();
+                let materials_weak = more_weak.clone();
                 el.child(
                     div()
                         .absolute()
@@ -1737,6 +2387,29 @@ impl Render for PlanEditor {
                                 .child(new_button(t.s("新建方案", "New plan"), cx))
                                 .child(file_button(t.s("打开方案", "Open"), cx, true))
                                 .child(import_button(t.s("导入底图", "Import"), cx))
+                                .child(
+                                    div()
+                                        .h(px(33.0))
+                                        .px(px(11.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(9.0))
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .hover(|style| style.bg(rgba(0x2328331c)))
+                                        .child(ui_icon(ICON_MATERIALS, 14.0, PANEL_MUTED))
+                                        .child(t.s("材料库", "Materials"))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, window, cx| {
+                                                if let Some(entity) = materials_weak.upgrade() {
+                                                    entity.update(cx, |this, cx| {
+                                                        this.open_materials(window, cx);
+                                                    });
+                                                }
+                                            },
+                                        ),
+                                )
                                 .child(file_button(t.s("另存为", "Save as"), cx, false))
                                 .child(
                                     div()
@@ -1825,8 +2498,37 @@ impl Render for PlanEditor {
                 el.child(import_modal(
                     import_input.clone(),
                     import_name.clone(),
+                    import_preview.clone(),
                     import_weak.clone(),
                     lang,
+                ))
+            })
+            .when(quote_open, |el| {
+                el.child(quote_modal(
+                    quote_inputs.clone(),
+                    quote_summary.clone(),
+                    project_name.clone(),
+                    import_weak.clone(),
+                    lang,
+                ))
+            })
+            .when(floor_open, |el| {
+                el.child(floor_modal(
+                    floor_inputs.clone(),
+                    floor_rows.clone(),
+                    floor_name.clone(),
+                    lang,
+                    cx.entity().downgrade(),
+                ))
+            })
+            .when(materials_open, |el| {
+                el.child(materials_modal(
+                    material_rows.clone(),
+                    self.material_scroll,
+                    material_edit,
+                    self.material_inputs.clone(),
+                    lang,
+                    cx.entity().downgrade(),
                 ))
             })
             .when(self.new_menu_open, |el| {
@@ -1894,8 +2596,8 @@ const ROW_BG: u32 = 0x2328330d;
 const CHROME_BG: u32 = 0xfdfcf9e6;
 const CHROME_BORDER: u32 = 0x23283321;
 const ACCENT: u32 = 0x2f6fed;
-const ACCENT_SOFT: u32 = 0x2f6fed1c;
-const ACCENT_LINE: u32 = 0x2f6fed61;
+const ACCENT_SOFT: u32 = 0x23283314;
+const ACCENT_LINE: u32 = 0x23283333;
 const GOOD: u32 = 0x3d8a61;
 const DOT_MUTED: u32 = 0x98a0ad;
 const DANGER: u32 = 0xbd4a41;
@@ -1914,6 +2616,9 @@ const ICON_FURNITURE: &str = r#"<path d='M4 11a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v2H
 const ICON_MEASURE: &str =
     r#"<path d='M4 17L17 4l3 3L7 20l-3-3z'/><path d='M9 12l2 2M12 9l2 2M15 6l2 2'/>"#;
 const ICON_DEMOLISH: &str = r#"<path d='M4 20l4-4M7 4h10v10H7z'/><path d='M9 8l6 6M15 8l-6 6'/>"#;
+const ICON_STAIR: &str = r#"<path d='M4 20h4v-4h4v-4h4v-4h4'/><path d='M4 20V4'/>"#;
+const ICON_MATERIALS: &str =
+    r#"<path d='M4 7h16v13H4z'/><path d='M4 7l8-4 8 4'/><path d='M8 12h8M8 16h5'/>"#;
 const ICON_LAYERS: &str =
     r#"<path d='M12 4l8 4-8 4-8-4 8-4z'/><path d='M4 12l8 4 8-4M4 16l8 4 8-4'/>"#;
 const ICON_2D: &str =
@@ -2043,6 +2748,7 @@ fn tool_button(
             div()
                 .text_size(px(10.0))
                 .font_weight(wgpui::FontWeight::MEDIUM)
+                .whitespace_nowrap()
                 .child(SharedString::from(label)),
         )
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
@@ -2104,6 +2810,7 @@ fn library_button(
             div()
                 .text_size(px(10.0))
                 .font_weight(wgpui::FontWeight::MEDIUM)
+                .whitespace_nowrap()
                 .child(SharedString::from(label)),
         )
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
@@ -2169,6 +2876,7 @@ fn layers_button(
             div()
                 .text_size(px(10.0))
                 .font_weight(wgpui::FontWeight::MEDIUM)
+                .whitespace_nowrap()
                 .child(SharedString::from(label)),
         )
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
@@ -2200,6 +2908,42 @@ fn chrome_button(
     action: fn(&mut PlanEditor, &mut Window, &mut Context<PlanEditor>),
 ) -> impl IntoElement {
     chrome_button_with_badge(icon, active, false, cx, action)
+}
+
+/// The quote entry: a visible ¥ in the top bar so the price is never buried in
+/// the room inspector again.
+fn quote_chrome_button(active: bool, cx: &mut Context<PlanEditor>) -> impl IntoElement {
+    let state = cx.entity().downgrade();
+    let fg = if active { ACCENT } else { PANEL_TEXT };
+    div()
+        .w(px(30.0))
+        .h(px(30.0))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(if active {
+            rgba(ACCENT_SOFT)
+        } else {
+            rgba(0x00000000)
+        })
+        .border_1()
+        .border_color(if active {
+            rgba(ACCENT_LINE)
+        } else {
+            rgba(0x00000000)
+        })
+        .text_size(px(14.0))
+        .font_weight(wgpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(fg))
+        .hover(|style| style.bg(rgba(0x23283318)).border_color(rgba(0x23283320)))
+        .child(SharedString::from("¥"))
+        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+            if let Some(entity) = state.upgrade() {
+                entity.update(cx, |this, cx| this.open_quote(window, cx));
+            }
+        })
 }
 
 fn chrome_button_with_badge(
@@ -2376,6 +3120,47 @@ fn doc_chip(
         .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
             if let Some(entity) = weak.upgrade() {
                 entity.update(cx, |this, cx| this.open_project_info(window, cx));
+            }
+        })
+}
+
+fn floor_chip(
+    name: String,
+    total: usize,
+    lang: i18n::Lang,
+    cx: &mut Context<PlanEditor>,
+) -> impl IntoElement {
+    let weak = cx.entity().downgrade();
+    let _ = lang;
+    div()
+        .h(px(30.0))
+        .px(px(9.0))
+        .rounded(px(8.0))
+        .bg(rgba(0xffffff9e))
+        .border_1()
+        .border_color(rgba(CHROME_BORDER))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0xffffffd6)))
+        .child(ui_icon(ICON_LAYERS, 11.0, PANEL_MUTED))
+        .child(
+            div()
+                .text_size(px(11.0))
+                .font_weight(wgpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(PANEL_TEXT))
+                .child(SharedString::from(name)),
+        )
+        .child(
+            div()
+                .text_size(px(8.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from(format!("{total}"))),
+        )
+        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+            if let Some(entity) = weak.upgrade() {
+                entity.update(cx, |this, cx| this.open_floor_menu(window, cx));
             }
         })
 }
@@ -3235,6 +4020,7 @@ fn inspector_icon(kind: InspectorKind) -> &'static str {
         InspectorKind::OpeningDoor => ICON_DOOR,
         InspectorKind::OpeningWindow => ICON_WINDOW,
         InspectorKind::Room => ICON_LAYERS,
+        InspectorKind::Stair => ICON_STAIR,
         InspectorKind::Multi => ICON_LAYERS,
     }
 }
@@ -3265,6 +4051,64 @@ fn inspector_action_is_danger(action: &InspectorAction) -> bool {
 
 fn hex_color(hex: &str) -> u32 {
     u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0x8f9299)
+}
+
+/// A wrapped grid of finish choices. `action_for` decides which inspector
+/// action the chip fires, so floors, walls and ceilings share the same UI.
+fn finish_action_chips(
+    options: Vec<(String, String, EntityId, bool)>,
+    action_for: fn(EntityId) -> InspectorAction,
+    width: f32,
+    cx: &mut Context<PlanEditor>,
+) -> Vec<AnyElement> {
+    options
+        .into_iter()
+        .map(|(name, hex, id, active)| {
+            let state = cx.entity().downgrade();
+            let swatch = hex_color(&hex);
+            div()
+                .w(px(width))
+                .h(px(28.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .bg(rgba(if active { ACCENT_SOFT } else { 0x23283308 }))
+                .border_1()
+                .border_color(rgba(if active { ACCENT_LINE } else { 0x2328330f }))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .text_size(px(9.5))
+                .text_color(if active { rgb(ACCENT) } else { rgb(PANEL_TEXT) })
+                .cursor_pointer()
+                .hover(|style| style.bg(rgba(0x23283312)))
+                .child(
+                    div()
+                        .w(px(13.0))
+                        .h(px(13.0))
+                        .rounded(px(3.0))
+                        .border_1()
+                        .border_color(rgba(if active { ACCENT } else { 0x23283318 }))
+                        .bg(rgb(swatch))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(active, |el| el.child(ui_icon(ICON_CHECK, 8.0, 0xffffff))),
+                )
+                .child(div().truncate().child(SharedString::from(name)))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    if let Some(entity) = state.upgrade() {
+                        entity.update(cx, |this, cx| {
+                            this.state
+                                .lock()
+                                .unwrap()
+                                .apply_action(action_for(id));
+                            cx.notify();
+                        });
+                    }
+                })
+                .into_any_element()
+        })
+        .collect()
 }
 
 fn inspector_field(field: scene::InspectorField, cx: &mut Context<PlanEditor>) -> AnyElement {
@@ -3372,11 +4216,12 @@ fn inspector_action_tile(
 }
 
 fn inspector_panel(
-    view: InspectorView,
+    mut view: InspectorView,
     wall_kind_open: bool,
+    lang: i18n::Lang,
     cx: &mut Context<PlanEditor>,
 ) -> impl IntoElement {
-    let t = i18n::T(i18n::load_lang());
+    let t = i18n::T(lang);
     let close_weak = cx.entity().downgrade();
     let icon = inspector_icon(view.kind);
     let wall_kind = view.wall_kind;
@@ -3499,6 +4344,37 @@ fn inspector_panel(
             );
         }
         body.push(section.into_any_element());
+    }
+
+    // Wall finish records come from the material library. Every built-in and
+    // custom wall finish is a chip, so adding one in the manager is enough.
+    if !view.wall_finish_options.is_empty() {
+        let wall_action: fn(EntityId) -> InspectorAction = if view.kind == InspectorKind::Multi {
+            InspectorAction::ApplyWallFinishToSelection
+        } else {
+            InspectorAction::SetWallFinishMaterial
+        };
+        let chips = finish_action_chips(
+            std::mem::take(&mut view.wall_finish_options),
+            wall_action,
+            111.0,
+            cx,
+        );
+        body.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(8.5))
+                        .font_weight(wgpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(t.s("墙面饰面 · FINISH", "Wall finish · FINISH")),
+                )
+                .child(div().flex().flex_wrap().gap(px(5.0)).children(chips))
+                .into_any_element(),
+        );
     }
 
     // Field groups, laid out exactly like the design demo: tiny uppercase
@@ -3700,50 +4576,59 @@ fn inspector_panel(
     }
 
     if !view.material_options.is_empty() {
-        let options: Vec<AnyElement> = view
-            .material_options
-            .into_iter()
-            .map(|(name, id, active)| {
-                let state = cx.entity().downgrade();
-                div()
-                    .w(px(119.0))
-                    .h(px(28.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .bg(rgba(if active { ACCENT_SOFT } else { 0x23283308 }))
-                    .border_1()
-                    .border_color(rgba(if active { ACCENT_LINE } else { 0x2328330f }))
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .text_size(px(9.5))
-                    .text_color(if active { rgb(ACCENT) } else { rgb(PANEL_TEXT) })
-                    .child(
-                        div()
-                            .w(px(13.0))
-                            .h(px(13.0))
-                            .rounded_full()
-                            .bg(rgba(if active { ACCENT } else { 0x23283318 }))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(active, |el| el.child(ui_icon(ICON_CHECK, 8.0, 0xffffff))),
-                    )
-                    .child(div().truncate().child(SharedString::from(name)))
-                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
-                        if let Some(entity) = state.upgrade() {
-                            entity.update(cx, |this, cx| {
-                                this.state
-                                    .lock()
-                                    .unwrap()
-                                    .apply_action(InspectorAction::SetMaterial(id));
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .into_any_element()
-            })
-            .collect();
+        let options = finish_action_chips(
+            std::mem::take(&mut view.material_options),
+            InspectorAction::SetMaterial,
+            119.0,
+            cx,
+        );
+        body.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(8.5))
+                                .font_weight(wgpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(PANEL_MUTED))
+                                .child("地面材质 · FLOORING"),
+                        )
+                        .child({
+                            let manage = cx.entity().downgrade();
+                            div()
+                                .text_size(px(8.5))
+                                .text_color(rgb(ACCENT))
+                                .cursor_pointer()
+                                .child(t.s("管理材料", "Manage"))
+                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                    if let Some(entity) = manage.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.open_materials(window, cx);
+                                        });
+                                    }
+                                })
+                        }),
+                )
+                .child(div().flex().flex_wrap().gap(px(6.0)).children(options))
+                .into_any_element(),
+        );
+    }
+
+    // Room ceiling finish. The built-in ceiling paint is assigned on first
+    // open, so a fresh room already quotes a ceiling without extra clicks.
+    if !view.ceiling_options.is_empty() {
+        let options = finish_action_chips(
+            std::mem::take(&mut view.ceiling_options),
+            InspectorAction::SetCeilingMaterial,
+            119.0,
+            cx,
+        );
         body.push(
             div()
                 .flex()
@@ -3754,7 +4639,7 @@ fn inspector_panel(
                         .text_size(px(8.5))
                         .font_weight(wgpui::FontWeight::SEMIBOLD)
                         .text_color(rgb(PANEL_MUTED))
-                        .child("地面材质 · FLOORING"),
+                        .child("顶面材质 · CEILING"),
                 )
                 .child(div().flex().flex_wrap().gap(px(6.0)).children(options))
                 .into_any_element(),
@@ -3790,8 +4675,10 @@ fn inspector_panel(
     }
 
     // Three actions per row keeps every tile readable, including the six-way
-    // alignment set for multi-selection.
-    for chunk in view.actions.chunks(3) {
+    // alignment set for multi-selection. English action labels are longer, so
+    // two per row keeps them on one line inside the 32 pt tiles.
+    let actions_per_row = if lang == i18n::Lang::En { 2 } else { 3 };
+    for chunk in view.actions.chunks(actions_per_row) {
         let row: Vec<AnyElement> = chunk
             .iter()
             .map(|(label, action)| inspector_action_tile(*label, action.clone(), cx))
@@ -3868,7 +4755,8 @@ fn inspector_panel(
                         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                             if let Some(entity) = close_weak.upgrade() {
                                 entity.update(cx, |this, cx| {
-                                    this.right_open = false;
+                                    this.inspector_collapsed = true;
+                                    this.inspector_shown = false;
                                     cx.notify();
                                 });
                             }
@@ -3885,6 +4773,42 @@ fn inspector_panel(
                 .gap(px(11.0))
                 .children(body),
         )
+}
+
+fn quote_menu_button(lang: i18n::Lang, cx: &mut Context<PlanEditor>) -> impl IntoElement {
+    let state = cx.entity().downgrade();
+    div()
+        .w_full()
+        .h(px(33.0))
+        .px(px(11.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(9.0))
+        .text_size(px(10.5))
+        .text_color(rgb(PANEL_TEXT))
+        .hover(|style| style.bg(rgba(0x2328331c)))
+        .child(
+            div()
+                .w(px(14.0))
+                .text_size(px(12.0))
+                .font_weight(wgpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from("¥")),
+        )
+        .child(SharedString::from(i18n::T(lang).s("全屋报价", "Quote")))
+        .child(
+            div()
+                .ml_auto()
+                .text_size(px(8.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from("PDF/XLSX")),
+        )
+        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+            if let Some(entity) = state.upgrade() {
+                entity.update(cx, |this, cx| this.open_quote(window, cx));
+            }
+        })
 }
 
 fn export_button(lang: i18n::Lang, cx: &mut Context<PlanEditor>) -> impl IntoElement {
@@ -4069,6 +4993,80 @@ fn export_pdf_button(lang: i18n::Lang, cx: &mut Context<PlanEditor>) -> impl Int
                 this.state.lock().unwrap().note = Some(match outcome {
                     Ok(msg) => format!("{msg} · ⌘P 直接打印"),
                     Err(err) => format!("PDF 导出失败 · {err}"),
+                });
+                cx.notify();
+            });
+        })
+}
+
+fn export_construction_button(lang: i18n::Lang, cx: &mut Context<PlanEditor>) -> impl IntoElement {
+    let state = cx.entity().downgrade();
+    div()
+        .w_full()
+        .h(px(46.0))
+        .px(px(11.0))
+        .py(px(5.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(9.0))
+        .text_color(rgb(PANEL_TEXT))
+        .hover(|style| style.bg(rgba(0x2328331c)))
+        .child(ui_icon(ICON_PDF, 14.0, PANEL_MUTED))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_size(px(10.5))
+                        .child(SharedString::from(
+                            i18n::T(lang).s("施工图 · A3 图纸集", "Construction · A3 set"),
+                        )),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_size(px(8.5))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(i18n::T(lang).s(
+                            "封面 + 平面 / 铺装 / 立面·剖面·节点",
+                            "Cover + plans / finishes / elevations·sections·details",
+                        ))),
+                ),
+        )
+        .child(
+            div()
+                .ml_auto()
+                .text_size(px(8.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from(i18n::T(lang).s("PDF", "PDF"))),
+        )
+        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            let picked = rfd::FileDialog::new()
+                .add_filter("PDF", &["pdf"])
+                .set_file_name("fathom-construction.pdf")
+                .save_file();
+            let Some(path) = picked else {
+                return;
+            };
+            let Some(entity) = state.upgrade() else {
+                return;
+            };
+            entity.update(cx, |this, cx| {
+                let outcome = {
+                    let s = this.state.lock().unwrap();
+                    export::export_construction_pdf(&s, &path)
+                };
+                this.state.lock().unwrap().note = Some(match outcome {
+                    Ok(msg) => msg,
+                    Err(err) => format!("施工图导出失败 · {err}"),
                 });
                 cx.notify();
             });
@@ -4402,6 +5400,7 @@ fn new_project_modal(
                         ),
                 )
                 .children(rows)
+                .child(import_card(lang, weak.clone()))
                 .child(
                     div()
                         .text_xs()
@@ -4438,6 +5437,76 @@ fn new_project_modal(
                     ),
                 ),
         )
+}
+
+fn import_card(lang: i18n::Lang, weak: WeakEntity<PlanEditor>) -> impl IntoElement {
+    let t = i18n::T(lang);
+    div()
+        .w_full()
+        .px_3()
+        .py_2()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgba(ACCENT_LINE))
+        .bg(rgba(0x2328330d))
+        .flex()
+        .items_center()
+        .gap_3()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0x23283318)))
+        .child(
+            div()
+                .w(px(34.0))
+                .h(px(34.0))
+                .rounded(px(8.0))
+                .bg(rgba(ACCENT_SOFT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(17.0))
+                .text_color(rgb(ACCENT))
+                .child(SharedString::from("↑")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(t.s("导入户型图 / DXF", "Import plan / DXF")),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(t.s(
+                            "PNG、JPG 识别墙线，或直接读取 DXF 矢量墙",
+                            "Detect walls from PNG/JPG, or read vector walls from DXF",
+                        )),
+                ),
+        )
+        .child(
+            div()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgba(0xffffff))
+                .text_size(px(9.0))
+                .text_color(rgb(ACCENT))
+                .child(t.s("先预览", "Preview first")),
+        )
+        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+            if let Some(entity) = weak.upgrade() {
+                entity.update(cx, |this, cx| {
+                    this.new_menu_open = false;
+                    this.pick_import(window, cx);
+                });
+            }
+        })
 }
 
 fn template_card(
@@ -4651,6 +5720,7 @@ fn render_loop(
 
         #[allow(clippy::large_enum_variant)]
         enum Frame {
+            Clear,
             Plan(Batch, [f32; 2], Option<underlay::UnderlayDraw>),
             Three(
                 std::sync::Arc<fp_render3d::MeshParts>,
@@ -4666,35 +5736,39 @@ fn render_loop(
             tick = Instant::now();
             s.walk_step(dt);
             s.clear_dirty();
-            match s.view {
-                ViewMode::Plan => {
-                    let batch = s.build_batch();
-                    let underlay = s.underlay_draw();
-                    Frame::Plan(batch, s.view_size, underlay)
-                }
-                ViewMode::Three => {
-                    let eye = s.cam3.eye();
-                    let aspect = s.view_size[0] / s.view_size[1].max(1.0);
-                    let (epoch, parts) = s.mesh3d_parts(false);
-                    Frame::Three(
-                        parts,
-                        epoch,
-                        s.cam3.view_proj(aspect),
-                        [eye.x, eye.y, eye.z],
-                        s.look3d(),
-                    )
-                }
-                ViewMode::Walk => {
-                    let eye = s.walk.pos;
-                    let aspect = s.view_size[0] / s.view_size[1].max(1.0);
-                    let (epoch, parts) = s.mesh3d_parts(true);
-                    Frame::Three(
-                        parts,
-                        epoch,
-                        s.walk.view_proj(aspect),
-                        [eye.x, eye.y, eye.z],
-                        s.look3d(),
-                    )
+            if s.modal_clear {
+                Frame::Clear
+            } else {
+                match s.view {
+                    ViewMode::Plan => {
+                        let batch = s.build_batch();
+                        let underlay = s.underlay_draw();
+                        Frame::Plan(batch, s.view_size, underlay)
+                    }
+                    ViewMode::Three => {
+                        let eye = s.cam3.eye();
+                        let aspect = s.view_size[0] / s.view_size[1].max(1.0);
+                        let (epoch, parts) = s.mesh3d_parts(false);
+                        Frame::Three(
+                            parts,
+                            epoch,
+                            s.cam3.view_proj(aspect),
+                            [eye.x, eye.y, eye.z],
+                            s.look3d(),
+                        )
+                    }
+                    ViewMode::Walk => {
+                        let eye = s.walk.pos;
+                        let aspect = s.view_size[0] / s.view_size[1].max(1.0);
+                        let (epoch, parts) = s.mesh3d_parts(true);
+                        Frame::Three(
+                            parts,
+                            epoch,
+                            s.walk.view_proj(aspect),
+                            [eye.x, eye.y, eye.z],
+                            s.look3d(),
+                        )
+                    }
                 }
             }
         };
@@ -4703,6 +5777,29 @@ fn render_loop(
             label: Some("plan enc"),
         });
         match frame {
+            Frame::Clear => {
+                let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("plan clear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
             Frame::Plan(batch, viewport, underlay) => {
                 queue.write_buffer(
                     &vp_buf,
@@ -4778,6 +5875,8 @@ fn render_loop(
 fn view3d_panel(
     rooms: Vec<(u128, String, f64)>,
     cutaway: bool,
+    show_roof: bool,
+    roof: RoofSettings,
     night: bool,
     sun: f32,
     lang: i18n::Lang,
@@ -4868,6 +5967,190 @@ fn view3d_panel(
                 });
             }
         });
+
+    let roof_weak = weak.clone();
+    let roof_row = div()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(if show_roof {
+            rgba(ACCENT_LINE)
+        } else {
+            rgba(CHROME_BORDER)
+        })
+        .bg(if show_roof {
+            rgba(ACCENT_SOFT)
+        } else {
+            rgba(0x2328330d)
+        })
+        .flex()
+        .justify_between()
+        .items_center()
+        .child(
+            div()
+                .text_xs()
+                .text_color(if show_roof {
+                    rgb(ACCENT)
+                } else {
+                    rgb(PANEL_TEXT)
+                })
+                .child(t.s("屋顶", "Roof")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(if show_roof {
+                    rgb(ACCENT)
+                } else {
+                    rgb(PANEL_MUTED)
+                })
+                .child(t.s(
+                    if show_roof { "开" } else { "关" },
+                    if show_roof { "on" } else { "off" },
+                )),
+        )
+        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            if let Some(entity) = roof_weak.upgrade() {
+                entity.update(cx, |this, cx| {
+                    this.state.lock().unwrap().set_roof(!show_roof);
+                    cx.notify();
+                });
+            }
+        });
+
+    let flat_weak = weak.clone();
+    let gable_weak = weak.clone();
+    let pitch_weak = weak.clone();
+    let eave_weak = weak.clone();
+    let kind_chip =
+        |label: &'static str, active: bool, kind: RoofKind, pick: WeakEntity<PlanEditor>| {
+            div()
+                .flex_1()
+                .py_1()
+                .rounded_md()
+                .text_center()
+                .text_xs()
+                .border_1()
+                .border_color(if active {
+                    rgba(ACCENT_LINE)
+                } else {
+                    rgba(CHROME_BORDER)
+                })
+                .bg(if active {
+                    rgba(ACCENT_SOFT)
+                } else {
+                    rgba(0x2328330d)
+                })
+                .text_color(if active {
+                    rgb(ACCENT)
+                } else {
+                    rgb(PANEL_MUTED)
+                })
+                .child(label)
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    if let Some(entity) = pick.upgrade() {
+                        entity.update(cx, |this, cx| {
+                            this.state.lock().unwrap().set_roof_kind(kind);
+                            cx.notify();
+                        });
+                    }
+                })
+        };
+    let roof_controls = if show_roof {
+        let pitch_row = if roof.kind == RoofKind::Gable {
+            div()
+                .flex()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .py_1()
+                        .rounded_md()
+                        .text_center()
+                        .text_xs()
+                        .bg(rgba(0x2328330a))
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(format!("{:.0}° 坡度", roof.pitch_deg)))
+                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            if let Some(entity) = pitch_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.state.lock().unwrap().cycle_roof_pitch();
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .py_1()
+                        .rounded_md()
+                        .text_center()
+                        .text_xs()
+                        .bg(rgba(0x2328330a))
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(format!("檐口 {}", roof.overhang_mm)))
+                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            if let Some(entity) = eave_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.state.lock().unwrap().cycle_roof_overhang();
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .child(
+                    div()
+                        .flex_1()
+                        .py_1()
+                        .rounded_md()
+                        .text_center()
+                        .text_xs()
+                        .bg(rgba(0x2328330a))
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(format!("檐口 {}", roof.overhang_mm)))
+                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            if let Some(entity) = eave_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.state.lock().unwrap().cycle_roof_overhang();
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(kind_chip(
+                        t.s("平屋顶", "Flat"),
+                        roof.kind == RoofKind::Flat,
+                        RoofKind::Flat,
+                        flat_weak,
+                    ))
+                    .child(kind_chip(
+                        t.s("坡屋顶", "Gable"),
+                        roof.kind == RoofKind::Gable,
+                        RoofKind::Gable,
+                        gable_weak,
+                    )),
+            )
+            .child(pitch_row)
+            .into_any_element()
+    } else {
+        div().into_any_element()
+    };
 
     let night_weak = weak.clone();
     let night_row = div()
@@ -5000,10 +6283,11 @@ fn view3d_panel(
                 .into_any_element(),
         );
     }
+    let close_weak = weak.clone();
     div()
         .absolute()
         .top(px(62.0))
-        .left(px(72.0))
+        .left(px(14.0))
         .w(px(220.0))
         .rounded(px(14.0))
         .bg(rgba(PANEL_BG))
@@ -5017,12 +6301,47 @@ fn view3d_panel(
         .gap_1()
         .child(
             div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(wgpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(t.s("3D 视图", "3D view")),
+                )
+                .child(
+                    div()
+                        .w(px(20.0))
+                        .h(px(20.0))
+                        .rounded(px(6.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgba(0x23283314)))
+                        .child(ui_icon(ICON_CLOSE, 11.0, PANEL_MUTED))
+                        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                            if let Some(entity) = close_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.view3d_open = false;
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                ),
+        )
+        .child(
+            div()
                 .text_xs()
-                .text_color(rgb(PANEL_TEXT))
+                .text_color(rgb(PANEL_MUTED))
                 .child(t.s("视角", "View")),
         )
         .child(div().flex().gap_1().children(buttons))
         .child(cut_row)
+        .child(roof_row)
+        .when(show_roof, |el| el.child(roof_controls))
         .child(night_row)
         .child(
             div()
@@ -5573,6 +6892,7 @@ fn library_panel(
 }
 
 const LIBRARY_ROWS: usize = 12;
+const MATERIAL_ROWS: usize = 7;
 
 fn project_modal(
     inputs: [Entity<text_input::TextInput>; 4],
@@ -5730,13 +7050,622 @@ fn project_modal(
 fn import_modal(
     input: Entity<text_input::TextInput>,
     file_name: String,
+    preview: Option<(PathBuf, usize, usize, usize, bool)>,
     weak: WeakEntity<PlanEditor>,
     lang: i18n::Lang,
 ) -> impl IntoElement {
     let t = i18n::T(lang);
+    let is_dxf = file_name.to_ascii_lowercase().ends_with(".dxf");
     let cancel_weak = weak.clone();
     let underlay_weak = weak.clone();
     let detect_weak = weak.clone();
+    let commit_weak = weak.clone();
+    let back_weak = weak.clone();
+
+    let card = div()
+        .w(px(if preview.is_some() { 560.0 } else { 440.0 }))
+        .rounded(px(14.0))
+        .border_1()
+        .border_color(rgba(CHROME_BORDER))
+        .shadow_lg()
+        .bg(rgba(0xfdfcf9f7))
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2();
+
+    let card = if let Some((path, walls, rooms, doors, vector)) = preview {
+        card.child(
+            div()
+                .text_sm()
+                .text_color(rgb(PANEL_TEXT))
+                .child(t.s("识别预览", "Recognition preview")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from(file_name)),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(280.0))
+                .rounded(px(9.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgba(0x23283316))
+                .bg(rgba(0xffffff))
+                .child(
+                    img(path.clone())
+                        .w_full()
+                        .h_full()
+                        .object_fit(ObjectFit::Contain),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(format!(
+                            "{} 段墙 · {} 个房间 · {} 个门洞",
+                            walls, rooms, doors
+                        ))),
+                )
+                .when(vector, |el| {
+                    el.child(
+                        div()
+                            .px_1()
+                            .rounded_md()
+                            .bg(rgba(ACCENT_SOFT))
+                            .text_size(px(9.5))
+                            .text_color(rgb(ACCENT))
+                            .child(t.s("DXF 矢量", "DXF vector")),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(PANEL_MUTED))
+                .child(if vector {
+                    t.s(
+                        "墙线来自 DXF 实体；弧墙、家具和文字暂不导入。",
+                        "Walls come from DXF entities; arcs, furniture and text are skipped.",
+                    )
+                } else {
+                    t.s(
+                        "红墙为识别结果，蓝线为房间边界；门洞是启发式结果，请逐项核对。",
+                        "Red lines are walls, blue are room edges; door gaps are heuristic — please verify.",
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba(0x2328330d))
+                        .text_xs()
+                        .child(t.s("返回调整", "Back"))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(entity) = back_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.reset_import_preview(window, cx);
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba(0x2328330d))
+                        .text_xs()
+                        .child(t.s("取消 (Esc)", "Cancel (Esc)"))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(entity) = cancel_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.close_import(window, cx);
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x2f6fed))
+                        .text_xs()
+                        .text_color(rgb(0xffffff))
+                        .child(t.s("采纳并新建", "Use this plan"))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(entity) = commit_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.commit_import_preview(window, cx);
+                                });
+                            }
+                        }),
+                ),
+        )
+    } else {
+        card.child(
+            div()
+                .text_sm()
+                .text_color(rgb(PANEL_TEXT))
+                .child(t.s("导入户型图", "Import floor plan")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from(file_name)),
+        )
+        .when(!is_dxf, |el| {
+            el.child(div().text_xs().text_color(rgb(PANEL_MUTED)).child(t.s(
+                "图纸主体实际宽度（毫米）",
+                "Real width of the drawing content (mm)",
+            )))
+            .child(
+                div()
+                    .h(px(32.0))
+                    .w_full()
+                    .px(px(9.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(7.0))
+                    .bg(rgba(0x2328330a))
+                    .border_1()
+                    .border_color(rgba(0x23283316))
+                    .child(input),
+            )
+        })
+        .when(is_dxf, |el| {
+            el.child(
+                div()
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgba(ACCENT_SOFT))
+                    .text_xs()
+                    .text_color(rgb(ACCENT))
+                    .child(t.s(
+                        "DXF 会按 $INSUNITS 自动换算为毫米，无需填写宽度。",
+                        "DXF uses $INSUNITS and is converted to mm automatically.",
+                    )),
+            )
+        })
+        .child(div().text_xs().text_color(rgb(PANEL_MUTED)).child(t.s(
+            "先识别并预览，确认后才写入当前方案；门窗和弧线可再手动补。",
+            "Detect first, preview, then apply; doors and arcs can still be added by hand.",
+        )))
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba(0x2328330d))
+                        .text_xs()
+                        .child(t.s("取消 (Esc)", "Cancel (Esc)"))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(entity) = cancel_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.close_import(window, cx);
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba(0x2328330d))
+                        .text_xs()
+                        .child(t.s("仅作底图", "Underlay only"))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(entity) = underlay_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.prepare_import(false, window, cx);
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x2f6fed))
+                        .text_xs()
+                        .text_color(rgb(0xffffff))
+                        .child(t.s("识别并预览", "Detect & preview"))
+                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                            if let Some(entity) = detect_weak.upgrade() {
+                                entity.update(cx, |this, cx| {
+                                    this.prepare_import(true, window, cx);
+                                });
+                            }
+                        }),
+                ),
+        )
+    };
+
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x0b0d1240))
+        .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {})
+        .child(card)
+}
+
+fn surface_rank(surface: fp_model::FinishSurface) -> u8 {
+    match surface {
+        fp_model::FinishSurface::Wall => 0,
+        fp_model::FinishSurface::Ceiling => 1,
+        fp_model::FinishSurface::Floor => 2,
+    }
+}
+
+fn material_rgb(c: [f32; 3]) -> u32 {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
+}
+
+fn materials_modal(
+    materials: Vec<(Material, usize, f64)>,
+    scroll: usize,
+    selected: Option<fp_core::EntityId>,
+    inputs: [Entity<text_input::TextInput>; 5],
+    lang: i18n::Lang,
+    weak: WeakEntity<PlanEditor>,
+) -> impl IntoElement {
+    let t = i18n::T(lang);
+    let close_weak = weak.clone();
+    let add_weak = weak.clone();
+    let save_weak = weak.clone();
+    let delete_weak = weak.clone();
+
+    let total = materials.len();
+    let start = scroll.min(total.saturating_sub(MATERIAL_ROWS));
+    let end = (start + MATERIAL_ROWS).min(total);
+    let mut rows = div().flex().flex_col().gap(px(3.0));
+    let mut last_surface = None;
+    for (material, usage, area) in materials.iter().skip(start).take(MATERIAL_ROWS) {
+        if last_surface != Some(material.surface) {
+            let count = materials
+                .iter()
+                .filter(|(m, _, _)| m.surface == material.surface)
+                .count();
+            rows = rows.child(
+                div()
+                    .pt_1()
+                    .pb(px(1.0))
+                    .text_size(px(8.5))
+                    .font_weight(wgpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(SharedString::from(format!(
+                        "{} · {}",
+                        material.surface_label_zh(),
+                        count
+                    ))),
+            );
+            last_surface = Some(material.surface);
+        }
+        let material_id = material.id;
+        let active = selected == Some(material_id);
+        let row_weak = weak.clone();
+        let swatch = material_rgb(material_color(material));
+        let usage_label = if *usage > 0 {
+            format!("{usage} 处 · {area:.1} ㎡")
+        } else {
+            t.s("未使用", "unused").to_string()
+        };
+        rows = rows.child(
+            div()
+                .h(px(38.0))
+                .px(px(8.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if active {
+                    rgba(ACCENT_LINE)
+                } else {
+                    rgba(0x23283314)
+                })
+                .bg(if active {
+                    rgba(ACCENT_SOFT)
+                } else {
+                    rgba(0xf7f6f3)
+                })
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgba(0xffffff)))
+                .child(
+                    div()
+                        .w(px(24.0))
+                        .h(px(24.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(rgba(0x00000018))
+                        .bg(rgb(swatch)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(wgpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(PANEL_TEXT))
+                                .truncate()
+                                .child(SharedString::from(material.name.clone())),
+                        )
+                        .child(div().text_size(px(8.5)).text_color(rgb(PANEL_MUTED)).child(
+                            SharedString::from(format!(
+                                "{} · {} · ¥{:.2}/㎡",
+                                material.surface_label_zh(),
+                                material.kind,
+                                material.price_per_m2
+                            )),
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(8.5))
+                        .text_color(if *usage > 0 {
+                            rgb(ACCENT)
+                        } else {
+                            rgb(PANEL_MUTED)
+                        })
+                        .child(SharedString::from(usage_label)),
+                )
+                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                    if let Some(entity) = row_weak.upgrade() {
+                        entity.update(cx, |this, cx| {
+                            this.select_material_edit(Some(material_id), window, cx);
+                        });
+                    }
+                }),
+        );
+    }
+    if materials.is_empty() {
+        rows = rows.child(
+            div()
+                .py_2()
+                .text_size(px(10.0))
+                .text_color(rgb(PANEL_MUTED))
+                .child(t.s("材料库为空，点右上角新增", "Library is empty")),
+        );
+    }
+
+    let selected_material = selected.and_then(|id| {
+        materials
+            .iter()
+            .find(|(m, _, _)| m.id == id)
+            .map(|(m, usage, area)| (m.clone(), *usage, *area))
+    });
+    let used = selected_material.as_ref().map(|(_, u, _)| *u).unwrap_or(0);
+    let used_area = selected_material
+        .as_ref()
+        .map(|(_, _, area)| *area)
+        .unwrap_or(0.0);
+    let color_input = inputs[3].clone();
+    let swatches = [
+        ("#c49a6c", 0xc49a6c_u32),
+        ("#6f4e37", 0x6f4e37),
+        ("#d6d4cd", 0xd6d4cd),
+        ("#a8b6c2", 0xa8b6c2),
+        ("#9e8c80", 0x9e8c80),
+        ("#cbc6b7", 0xcbc6b7),
+        ("#b8b4ac", 0xb8b4ac),
+        ("#5d6b5b", 0x5d6b5b),
+    ];
+    let mut swatch_row = div().flex().items_center().gap(px(5.0));
+    for (hex, color) in swatches {
+        let input = color_input.clone();
+        let swatch_weak = weak.clone();
+        swatch_row = swatch_row.child(
+            div()
+                .w(px(20.0))
+                .h(px(20.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(rgba(0x00000016))
+                .bg(rgb(color))
+                .cursor_pointer()
+                .hover(|style| style.border_color(rgba(ACCENT_LINE)))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    input.update(cx, |field, cx| field.set_text(hex, cx));
+                    if let Some(entity) = swatch_weak.upgrade() {
+                        entity.update(cx, |_this, cx| cx.notify());
+                    }
+                }),
+        );
+    }
+
+    let cell = |index: usize, label: &'static str| -> AnyElement {
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(7.0))
+                    .rounded(px(6.0))
+                    .bg(rgba(0xffffff))
+                    .border_1()
+                    .border_color(rgba(0x23283316))
+                    .child(inputs[index].clone()),
+            )
+            .into_any_element()
+    };
+
+    let editor = if selected_material.is_some() {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(wgpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(PANEL_TEXT))
+                            .child(t.s("编辑材料", "Edit material")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(if used > 0 {
+                                rgb(ACCENT)
+                            } else {
+                                rgb(PANEL_MUTED)
+                            })
+                            .child(SharedString::from(if used > 0 {
+                                format!("{used} 处 · {used_area:.1} ㎡")
+                            } else {
+                                "未使用".to_string()
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(cell(0, t.s("名称", "Name")))
+                    .child(cell(1, t.s("单价 元/㎡", "Price ¥/m²"))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(cell(2, t.s("纹理类型", "Texture kind")))
+                    .child(cell(4, t.s("适用面", "Surface"))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(cell(3, t.s("自定义颜色", "Custom colour"))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(rgb(PANEL_MUTED))
+                            .child(t.s("色板", "Swatches")),
+                    )
+                    .child(swatch_row),
+            )
+            .child(
+                div()
+                    .text_size(px(8.5))
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(t.s(
+                        "颜色留空 = 按纹理自动；纹理 paint 涂料、wallpaper 壁纸、wood_panel 木饰面、tile 瓷砖、wood 木地板。适用面 floor 地面、wall 墙面、ceiling 顶面。",
+                        "Empty colour follows the texture kind. Surface: floor / wall / ceiling.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .pt_1()
+                    .child(
+                        div()
+                            .h(px(30.0))
+                            .px_3()
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(rgba(0xb4453c55))
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.0))
+                            .text_color(rgb(0xb4453c))
+                            .hover(|style| style.bg(rgba(0xb4453c12)))
+                            .child(t.s("删除材料", "Delete"))
+                            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                if let Some(entity) = delete_weak.upgrade() {
+                                    entity.update(cx, |this, cx| {
+                                        this.delete_material_edit(window, cx);
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .h(px(30.0))
+                            .px_4()
+                            .rounded(px(6.0))
+                            .bg(rgba(ACCENT))
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.0))
+                            .text_color(rgb(0xffffff))
+                            .hover(|style| style.bg(rgba(0x2e61d4)))
+                            .child(t.s("保存修改", "Save"))
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                if let Some(entity) = save_weak.upgrade() {
+                                    entity.update(cx, |this, cx| this.save_material_edit(cx));
+                                }
+                            }),
+                    ),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.0))
+            .text_color(rgb(PANEL_MUTED))
+            .child(t.s("选择左侧材料，或新增一种", "Select a material"))
+            .into_any_element()
+    };
+
     div()
         .absolute()
         .inset_0()
@@ -5747,7 +7676,714 @@ fn import_modal(
         .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {})
         .child(
             div()
-                .w(px(430.0))
+                .w(px(700.0))
+                .rounded(px(14.0))
+                .bg(rgba(0xfdfcf9fa))
+                .border_1()
+                .border_color(rgba(CHROME_BORDER))
+                .shadow_lg()
+                .p(px(18.0))
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("材料库", "Material library")),
+                                )
+                                .child(
+                                    div().text_size(px(9.0)).text_color(rgb(PANEL_MUTED)).child(
+                                        SharedString::from(format!(
+                                            "{} 种材料 · 单价用于全屋报价",
+                                            materials.len()
+                                        )),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .h(px(28.0))
+                                        .px_3()
+                                        .rounded(px(7.0))
+                                        .bg(rgba(ACCENT_SOFT))
+                                        .border_1()
+                                        .border_color(rgba(ACCENT_LINE))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(ACCENT))
+                                        .hover(|style| style.bg(rgba(0xdbe6ff)))
+                                        .child(t.s("新增材料", "New material"))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, window, cx| {
+                                                if let Some(entity) = add_weak.upgrade() {
+                                                    entity.update(cx, |this, cx| {
+                                                        this.add_material(window, cx);
+                                                    });
+                                                }
+                                            },
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(24.0))
+                                        .h(px(24.0))
+                                        .rounded(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .hover(|style| style.bg(rgba(0x23283312)))
+                                        .child(ui_icon(ICON_CLOSE, 12.0, PANEL_MUTED))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, window, cx| {
+                                                if let Some(entity) = close_weak.upgrade() {
+                                                    entity.update(cx, |this, cx| {
+                                                        this.close_materials(window, cx);
+                                                    });
+                                                }
+                                            },
+                                        ),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .w(px(300.0))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_size(px(8.5))
+                                                .text_color(rgb(PANEL_MUTED))
+                                                .child(SharedString::from(format!(
+                                                    "{}-{} / {}",
+                                                    if total == 0 { 0 } else { start + 1 },
+                                                    end,
+                                                    total
+                                                ))),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(8.5))
+                                                .text_color(rgb(PANEL_MUTED))
+                                                .child(t.s("滚轮翻页", "wheel")),
+                                        ),
+                                )
+                                .child(div().h(px(314.0)).overflow_hidden().child(rows)),
+                        )
+                        .child(div().flex_1().min_w(px(0.0)).child(editor)),
+                )
+                .child(
+                    div()
+                        .text_size(px(8.5))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(t.s(
+                            "修改单价会立即影响报价；删除前需先把使用该材料的房间改到其他材料。",
+                            "Price changes flow into the quote; reassign rooms before deleting.",
+                        )),
+                ),
+        )
+}
+
+fn floor_modal(
+    inputs: [Entity<text_input::TextInput>; 2],
+    rows: Vec<(usize, String, i32, bool)>,
+    current: String,
+    lang: i18n::Lang,
+    weak: WeakEntity<PlanEditor>,
+) -> impl IntoElement {
+    let t = i18n::T(lang);
+    let close_weak = weak.clone();
+    let mut list = div().flex().flex_col().gap(px(6.0));
+    for (index, name, height, active) in rows {
+        let row_weak = weak.clone();
+        let fg = if active { ACCENT } else { PANEL_TEXT };
+        let bg = if active {
+            rgba(0x23283312)
+        } else {
+            rgba(0xf7f6f3)
+        };
+        list = list.child(
+            div()
+                .h(px(36.0))
+                .px(px(10.0))
+                .rounded(px(8.0))
+                .bg(bg)
+                .border_1()
+                .border_color(if active {
+                    rgba(ACCENT_LINE)
+                } else {
+                    rgba(CHROME_BORDER)
+                })
+                .flex()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .hover(|style| style.bg(rgba(0xffffff)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(wgpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(fg))
+                                .child(SharedString::from(name)),
+                        )
+                        .when(active, |el| {
+                            el.child(
+                                div()
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgba(ACCENT_LINE))
+                                    .text_size(px(8.0))
+                                    .text_color(rgb(ACCENT))
+                                    .child(t.s("当前", "Active")),
+                            )
+                        }),
+                )
+                .child(div().text_size(px(9.5)).text_color(rgb(PANEL_MUTED)).child(
+                    SharedString::from(format!("{:.1} m", height as f32 / 1000.0)),
+                ))
+                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                    if let Some(entity) = row_weak.upgrade() {
+                        entity.update(cx, |this, cx| this.choose_level(index, cx));
+                    }
+                }),
+        );
+    }
+
+    let add_weak = weak.clone();
+    let copy_weak = weak.clone();
+    let remove_weak = weak.clone();
+    let close_weak2 = close_weak.clone();
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x0b0d1240))
+        .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {})
+        .child(
+            div()
+                .w(px(360.0))
+                .rounded(px(14.0))
+                .bg(rgba(0xfdfcf9fa))
+                .border_1()
+                .border_color(rgba(CHROME_BORDER))
+                .shadow_lg()
+                .p(px(20.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .font_weight(wgpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("楼层", "Levels")),
+                                )
+                                .child(
+                                    div().text_size(px(9.5)).text_color(rgb(PANEL_MUTED)).child(
+                                        SharedString::from(format!(
+                                            "{} · 2D/3D {}",
+                                            current,
+                                            t.s("同步显示", "in sync")
+                                        )),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(22.0))
+                                .h(px(22.0))
+                                .rounded(px(5.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0x2328330d)))
+                                .child(ui_icon(ICON_CLOSE, 12.0, PANEL_MUTED))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = close_weak2.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.floor_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div().text_size(px(9.5)).text_color(rgb(PANEL_MUTED)).child(
+                                t.s("当前楼层 · 名称与层高", "Active level · name and height"),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .h(px(30.0))
+                                        .px(px(8.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(7.0))
+                                        .bg(rgba(0xffffff))
+                                        .border_1()
+                                        .border_color(rgba(CHROME_BORDER))
+                                        .child(inputs[0].clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(92.0))
+                                        .h(px(30.0))
+                                        .px(px(8.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(7.0))
+                                        .bg(rgba(0xffffff))
+                                        .border_1()
+                                        .border_color(rgba(CHROME_BORDER))
+                                        .child(inputs[1].clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(8.5))
+                                .text_color(rgb(PANEL_MUTED))
+                                .child(t.s(
+                                    "回车应用 · 层高 1800–6000 mm · 切换楼层自动填入",
+                                    "Enter to apply · 1800–6000 mm · auto-filled per level",
+                                )),
+                        ),
+                )
+                .child(list)
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(30.0))
+                                .rounded(px(7.0))
+                                .border_1()
+                                .border_color(rgba(CHROME_BORDER))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(5.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0xffffff)))
+                                .child(ui_icon(ICON_PLUS, 11.0, ACCENT))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(ACCENT))
+                                        .child(t.s("空白楼层", "Blank")),
+                                )
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = add_weak.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.state.lock().unwrap().add_level(false);
+                                            this.floor_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(30.0))
+                                .rounded(px(7.0))
+                                .border_1()
+                                .border_color(rgba(CHROME_BORDER))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(5.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0xffffff)))
+                                .child(ui_icon(ICON_PLUS, 11.0, ACCENT))
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(ACCENT))
+                                        .child(t.s("复制本层", "Copy shell")),
+                                )
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = copy_weak.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.state.lock().unwrap().add_level(true);
+                                            this.floor_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(rgb(DANGER))
+                                .cursor_pointer()
+                                .child(t.s("删除当前楼层", "Remove level"))
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = remove_weak.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.state.lock().unwrap().remove_active_level();
+                                            this.floor_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            div()
+                                .h(px(26.0))
+                                .px(px(12.0))
+                                .rounded(px(6.0))
+                                .bg(rgba(0x2328330d))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(PANEL_MUTED))
+                                        .child(t.s("关闭", "Close")),
+                                )
+                                .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                    if let Some(entity) = close_weak.upgrade() {
+                                        entity.update(cx, |this, cx| {
+                                            this.floor_open = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                ),
+        )
+}
+
+fn quote_modal(
+    inputs: [Entity<text_input::TextInput>; 4],
+    quote: quote::Quote,
+    project: String,
+    weak: WeakEntity<PlanEditor>,
+    lang: i18n::Lang,
+) -> impl IntoElement {
+    let t = i18n::T(lang);
+    let close_weak = weak.clone();
+    let apply_weak = weak.clone();
+    let csv_weak = weak.clone();
+    let xlsx_weak = weak.clone();
+    let pdf_weak = weak.clone();
+    let total = quote::money(quote.total);
+
+    let room_limit = if quote.levels.len() > 1 { 4 } else { 6 };
+    let mut room_rows: Vec<AnyElement> = Vec::new();
+    for room in quote.rooms.iter().take(room_limit) {
+        room_rows.push(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py(px(5.0))
+                .border_b_1()
+                .border_color(rgba(0x23283310))
+                .text_size(px(10.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(room.name.clone())),
+                )
+                .child(
+                    div()
+                        .w(px(62.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(format!("{:.1} m²", room.area_m2))),
+                )
+                .child(
+                    div()
+                        .w(px(82.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(quote::money(room.floor_cost))),
+                )
+                .child(
+                    div()
+                        .w(px(82.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(quote::money(room.ceiling_cost))),
+                )
+                .child(
+                    div()
+                        .w(px(82.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(quote::money(room.furniture_cost))),
+                )
+                .child(
+                    div()
+                        .w(px(88.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(quote::money(room.total()))),
+                )
+                .into_any_element(),
+        );
+    }
+    if quote.rooms.is_empty() {
+        room_rows.push(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(PANEL_MUTED))
+                .child(t.s("还没有封闭房间", "No closed rooms yet"))
+                .into_any_element(),
+        );
+    }
+    if quote.rooms.len() > room_limit {
+        room_rows.push(
+            div()
+                .text_size(px(9.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from(format!(
+                    "另有 {} 个房间，见导出清单",
+                    quote.rooms.len() - room_limit
+                )))
+                .into_any_element(),
+        );
+    }
+
+    let mut level_rows: Vec<AnyElement> = Vec::new();
+    for level in &quote.levels {
+        level_rows.push(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py(px(3.0))
+                .text_size(px(9.5))
+                .child(
+                    div()
+                        .w(px(46.0))
+                        .font_weight(wgpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(level.name.clone())),
+                )
+                .child(
+                    div()
+                        .w(px(46.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(format!("{} 房", level.room_count))),
+                )
+                .child(
+                    div()
+                        .w(px(62.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(format!("{:.1} m²", level.net_area_m2))),
+                )
+                .child(
+                    div()
+                        .w(px(78.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(quote::money(level.floor_cost))),
+                )
+                .child(
+                    div()
+                        .w(px(78.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(quote::money(level.furniture_cost))),
+                )
+                .child(
+                    div()
+                        .w(px(78.0))
+                        .text_right()
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(quote::money(level.opening_total))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_right()
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(quote::money(level.total))),
+                )
+                .into_any_element(),
+        );
+    }
+
+    let mut finish_rows: Vec<AnyElement> = Vec::new();
+    for row in quote.finish_rows.iter().take(4) {
+        finish_rows.push(
+            div()
+                .flex()
+                .justify_between()
+                .text_size(px(9.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from(format!(
+                    "{} · {}",
+                    row.surface, row.name
+                )))
+                .child(SharedString::from(quote::money(row.amount)))
+                .into_any_element(),
+        );
+    }
+    if quote.finish_rows.is_empty() {
+        finish_rows.push(
+            div()
+                .text_size(px(9.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(t.s("还没有墙面/顶面饰面", "No wall or ceiling finishes"))
+                .into_any_element(),
+        );
+    }
+
+    let mut furniture_rows: Vec<AnyElement> = Vec::new();
+    for row in quote.furniture.iter().take(6) {
+        furniture_rows.push(
+            div()
+                .flex()
+                .justify_between()
+                .text_size(px(9.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(SharedString::from(format!("{} ×{}", row.name, row.count)))
+                .child(SharedString::from(quote::money(row.amount)))
+                .into_any_element(),
+        );
+    }
+    if quote.furniture.is_empty() {
+        furniture_rows.push(
+            div()
+                .text_size(px(9.5))
+                .text_color(rgb(PANEL_MUTED))
+                .child(t.s("还没有家具", "No furniture yet"))
+                .into_any_element(),
+        );
+    }
+
+    let summary = |label: &'static str, value: f64| {
+        div()
+            .w(px(160.0))
+            .flex()
+            .justify_between()
+            .text_size(px(9.5))
+            .child(
+                div()
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(SharedString::from(label)),
+            )
+            .child(
+                div()
+                    .text_color(rgb(PANEL_TEXT))
+                    .child(SharedString::from(quote::money(value))),
+            )
+            .into_any_element()
+    };
+
+    let input_cell = |index: usize, label: &'static str| {
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(PANEL_MUTED))
+                    .child(SharedString::from(label)),
+            )
+            .child(
+                div()
+                    .h(px(28.0))
+                    .w_full()
+                    .px(px(7.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .bg(rgba(0x2328330a))
+                    .border_1()
+                    .border_color(rgba(0x23283316))
+                    .child(inputs[index].clone()),
+            )
+    };
+
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x0b0d1240))
+        .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {})
+        .child(
+            div()
+                .w(px(760.0))
                 .rounded(px(14.0))
                 .border_1()
                 .border_color(rgba(CHROME_BORDER))
@@ -5756,106 +8392,300 @@ fn import_modal(
                 .p_4()
                 .flex()
                 .flex_col()
-                .gap_2()
+                .gap_3()
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(rgb(PANEL_TEXT))
-                        .child(t.s("导入户型图", "Import floor plan")),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(PANEL_MUTED))
-                        .child(SharedString::from(file_name)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(PANEL_MUTED))
-                        .child(t.s(
-                            "图纸主体实际宽度（毫米）",
-                            "Real width of the drawing content (mm)",
-                        )),
-                )
-                .child(
-                    div()
-                        .h(px(32.0))
-                        .w_full()
-                        .px(px(9.0))
                         .flex()
+                        .justify_between()
                         .items_center()
-                        .rounded(px(7.0))
-                        .bg(rgba(0x2328330a))
-                        .border_1()
-                        .border_color(rgba(0x23283316))
-                        .child(input),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(PANEL_MUTED))
-                        .child(t.s(
-                            "识别只提取粗横竖墙线，门窗和弧线请手动补。",
-                            "Only thick horizontal/vertical walls are detected; add doors and arcs by hand.",
-                        )),
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("全屋报价", "Whole-home quote")),
+                                )
+                                .child(div().text_xs().text_color(rgb(PANEL_MUTED)).child(
+                                    SharedString::from(if project.is_empty() {
+                                        "未命名方案".to_string()
+                                    } else {
+                                        project
+                                    }),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded(px(9.0))
+                                        .bg(rgba(ACCENT_SOFT))
+                                        .text_size(px(18.0))
+                                        .font_weight(wgpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(ACCENT))
+                                        .child(SharedString::from(total)),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(24.0))
+                                        .h(px(24.0))
+                                        .rounded(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .hover(|style| style.bg(rgba(0x23283312)))
+                                        .child(ui_icon(ICON_CLOSE, 12.0, PANEL_MUTED))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, window, cx| {
+                                                if let Some(entity) = close_weak.upgrade() {
+                                                    entity.update(cx, |this, cx| {
+                                                        this.close_quote(window, cx);
+                                                    });
+                                                }
+                                            },
+                                        ),
+                                ),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
-                        .justify_end()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().flex().gap_2().children(vec![
+                            summary("地面材料", quote.floor_material),
+                            summary("墙面饰面", quote.wall_material),
+                            summary("顶面饰面", quote.ceiling_material),
+                            summary("家具", quote.furniture_total),
+                        ]))
+                        .child(div().flex().gap_2().children(vec![
+                            summary("门窗", quote.opening_total),
+                            summary("人工 + 辅材", quote.labor + quote.auxiliary),
+                            summary("小计", quote.subtotal),
+                            summary("总计", quote.total),
+                        ]))
+                        .child(div().flex().gap_2().children(vec![
+                            summary("折扣", -quote.discount),
+                            summary("税金", quote.tax),
+                        ])),
+                )
+                .when(quote.levels.len() > 1, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pt(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(PANEL_TEXT))
+                                    .child(t.s("分楼层小计 · 直接费", "By level · direct cost")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .py(px(2.0))
+                                    .text_size(px(8.5))
+                                    .text_color(rgb(PANEL_MUTED))
+                                    .child(div().w(px(46.0)).child(t.s("楼层", "Level")))
+                                    .child(
+                                        div().w(px(46.0)).text_right().child(t.s("房间", "Rooms")),
+                                    )
+                                    .child(
+                                        div().w(px(62.0)).text_right().child(t.s("面积", "Area")),
+                                    )
+                                    .child(
+                                        div().w(px(78.0)).text_right().child(t.s("地面", "Floor")),
+                                    )
+                                    .child(
+                                        div().w(px(78.0)).text_right().child(t.s("家具", "Furn.")),
+                                    )
+                                    .child(
+                                        div().w(px(78.0)).text_right().child(t.s("门窗", "Open.")),
+                                    )
+                                    .child(div().flex_1().text_right().child(t.s("小计", "Total"))),
+                            )
+                            .children(level_rows),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("分房间", "By room")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .py(px(4.0))
+                                        .text_size(px(9.0))
+                                        .text_color(rgb(PANEL_MUTED))
+                                        .child(div().flex_1().child(t.s("房间", "Room")))
+                                        .child(div().w(px(62.0)).text_right().child("面积"))
+                                        .child(div().w(px(82.0)).text_right().child("地面"))
+                                        .child(div().w(px(82.0)).text_right().child("顶面"))
+                                        .child(div().w(px(82.0)).text_right().child("家具"))
+                                        .child(div().w(px(88.0)).text_right().child("小计")),
+                                )
+                                .children(room_rows),
+                        )
+                        .child(
+                            div()
+                                .w(px(210.0))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("饰面明细", "Finishes")),
+                                )
+                                .children(finish_rows)
+                                .child(
+                                    div()
+                                        .mt(px(8.0))
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("家具明细", "Furniture")),
+                                )
+                                .children(furniture_rows)
+                                .child(
+                                    div()
+                                        .mt(px(8.0))
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(PANEL_TEXT))
+                                        .child(t.s("门窗与损耗", "Openings")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(PANEL_MUTED))
+                                        .child(SharedString::from(format!(
+                                            "门 {} / 窗 {}",
+                                            quote.door_count, quote.window_count
+                                        )))
+                                        .child(SharedString::from(quote::money(
+                                            quote.opening_total,
+                                        ))),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .text_size(px(9.5))
+                                        .text_color(rgb(PANEL_MUTED))
+                                        .child(t.s("其中损耗", "Waste included"))
+                                        .child(SharedString::from(quote::money(quote.floor_waste))),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
                         .gap_2()
+                        .child(input_cell(0, t.s("人工 元/㎡", "Labour ¥/m²")))
+                        .child(input_cell(1, t.s("辅材 元/㎡", "Auxiliary ¥/m²")))
+                        .child(input_cell(2, t.s("税率 %", "Tax %")))
+                        .child(input_cell(3, t.s("折扣 %", "Discount %")))
+                        .child(
+                            div().w(px(64.0)).pt(px(14.0)).child(
+                                div()
+                                    .h(px(28.0))
+                                    .rounded(px(6.0))
+                                    .bg(rgba(0x2328330d))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(PANEL_TEXT))
+                                    .hover(|style| style.bg(rgba(0x23283318)))
+                                    .child(t.s("应用", "Apply"))
+                                    .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                        if let Some(entity) = apply_weak.upgrade() {
+                                            entity.update(cx, |this, cx| {
+                                                this.apply_quote_settings(cx);
+                                            });
+                                        }
+                                    }),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
                         .child(
                             div()
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgba(0x2328330d))
-                                .text_xs()
-                                .child(t.s("取消 (Esc)", "Cancel (Esc)"))
-                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                                    if let Some(entity) = cancel_weak.upgrade() {
-                                        entity.update(cx, |this, cx| {
-                                            this.close_import(window, cx);
-                                        });
-                                    }
-                                }),
+                                .text_size(px(9.0))
+                                .text_color(rgb(PANEL_MUTED))
+                                .child(t.s(
+                                    "人工/辅材按建筑面积估算；地面含 5% 损耗。",
+                                    "Labour/auxiliary use floor area; flooring includes 5% waste.",
+                                )),
                         )
                         .child(
                             div()
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgba(0x2328330d))
-                                .text_xs()
-                                .child(t.s("仅作底图", "Underlay only"))
-                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                                    if let Some(entity) = underlay_weak.upgrade() {
-                                        entity.update(cx, |this, cx| {
-                                            this.confirm_import(false, window, cx);
-                                        });
-                                    }
-                                }),
-                        )
-                        .child(
-                            div()
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(0x2f6fed))
-                                .text_xs()
-                                .text_color(rgb(0xffffff))
-                                .child(t.s("识别并新建", "Detect & create"))
-                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                                    if let Some(entity) = detect_weak.upgrade() {
-                                        entity.update(cx, |this, cx| {
-                                            this.confirm_import(true, window, cx);
-                                        });
-                                    }
-                                }),
+                                .flex()
+                                .gap_2()
+                                .child(quote_export_action(t.s("CSV", "CSV"), "csv", csv_weak))
+                                .child(quote_export_action(t.s("XLSX", "XLSX"), "xlsx", xlsx_weak))
+                                .child(quote_export_action(
+                                    t.s("PDF 报价单", "PDF quote"),
+                                    "pdf",
+                                    pdf_weak,
+                                )),
                         ),
                 ),
         )
+}
+
+fn quote_export_action(
+    label: &'static str,
+    extension: &'static str,
+    weak: WeakEntity<PlanEditor>,
+) -> impl IntoElement {
+    div()
+        .h(px(28.0))
+        .px_3()
+        .rounded(px(6.0))
+        .bg(rgba(0x2328330d))
+        .flex()
+        .items_center()
+        .text_size(px(10.0))
+        .text_color(rgb(PANEL_TEXT))
+        .hover(|style| style.bg(rgba(0x23283318)))
+        .child(SharedString::from(label))
+        .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            if let Some(entity) = weak.upgrade() {
+                entity.update(cx, |this, cx| this.export_quote(extension, cx));
+            }
+        })
 }
 
 fn inspector_edit_modal(
@@ -5870,12 +8700,16 @@ fn inspector_edit_modal(
         InspectorEdit::FurnitureDepth => t.s("编辑家具深度", "Edit furniture depth"),
         InspectorEdit::FurnitureX => t.s("编辑家具左右位置", "Edit furniture X"),
         InspectorEdit::FurnitureY => t.s("编辑家具上下位置", "Edit furniture Y"),
+        InspectorEdit::FurniturePrice => t.s("编辑家具单价", "Edit furniture price"),
         InspectorEdit::WallLength => t.s("编辑墙体长度", "Edit wall length"),
         InspectorEdit::WallThickness => t.s("编辑墙体厚度", "Edit wall thickness"),
         InspectorEdit::WallHeight => t.s("编辑墙体高度", "Edit wall height"),
         InspectorEdit::OpeningWidth => t.s("编辑开口宽度", "Edit opening width"),
         InspectorEdit::OpeningHeight => t.s("编辑开口高度", "Edit opening height"),
         InspectorEdit::OpeningSill => t.s("编辑开口台高", "Edit opening sill"),
+        InspectorEdit::OpeningPrice => t.s("编辑门窗单价", "Edit opening price"),
+        InspectorEdit::StairWidth => t.s("编辑楼梯宽度", "Edit stair width"),
+        InspectorEdit::StairSteps => t.s("编辑楼梯踏步数", "Edit stair steps"),
     };
     let hint = match edit {
         InspectorEdit::FurnitureWidth | InspectorEdit::FurnitureDepth => t.s(
@@ -5885,6 +8719,10 @@ fn inspector_edit_modal(
         InspectorEdit::FurnitureX | InspectorEdit::FurnitureY => t.s(
             "平面坐标，单位 mm · 回车应用",
             "Plan coordinate in mm · Enter to apply",
+        ),
+        InspectorEdit::FurniturePrice | InspectorEdit::OpeningPrice => t.s(
+            "单位元，0 表示赠送 · 回车应用",
+            "Yuan, 0 means free · Enter to apply",
         ),
         InspectorEdit::WallLength => t.s(
             "范围 300–30000 mm · 起点固定 · 回车应用",
@@ -5909,6 +8747,14 @@ fn inspector_edit_modal(
         InspectorEdit::OpeningSill => t.s(
             "范围 0–2000 mm · 回车应用",
             "Range 0–2000 mm · Enter to apply",
+        ),
+        InspectorEdit::StairWidth => t.s(
+            "范围 600–2000 mm · 回车应用",
+            "Range 600–2000 mm · Enter to apply",
+        ),
+        InspectorEdit::StairSteps => t.s(
+            "范围 3–40 级 · 回车应用",
+            "Range 3–40 steps · Enter to apply",
         ),
     };
     let cancel_weak = weak.clone();
@@ -6196,6 +9042,121 @@ fn install_transparent_titlebar(window: &Window) {
 #[cfg(not(target_os = "macos"))]
 fn install_transparent_titlebar(_window: &Window) {}
 
+/// macOS keeps a single-window document app alive after the red close button,
+/// but winit's app delegate never implements
+/// `applicationShouldHandleReopen:hasVisibleWindows:`, so clicking the Dock
+/// icon used to do nothing. Hide the window instead of destroying it and
+/// install a reopen handler that brings the same editor session back.
+#[cfg(target_os = "macos")]
+static MAIN_NSWINDOW: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(target_os = "macos")]
+fn install_window_presence_hooks(window: &mut Window, cx: &mut App) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = <Window as HasWindowHandle>::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let view = appkit.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+    if view.is_null() {
+        return;
+    }
+    unsafe {
+        let nswindow: *mut objc2::runtime::AnyObject = objc2::msg_send![view, window];
+        if nswindow.is_null() {
+            return;
+        }
+        MAIN_NSWINDOW.store(nswindow.cast(), std::sync::atomic::Ordering::Release);
+        install_reopen_handler();
+    }
+    window.on_window_should_close(cx, |_window, _cx| {
+        // Returning false cancels the close, so the plan, undo history and the
+        // render thread all survive; the Dock icon can order the window back.
+        hide_main_window();
+        false
+    });
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn install_reopen_handler() {
+    use objc2::runtime::AnyObject;
+
+    unsafe {
+        let app: *mut AnyObject = objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        let delegate: *mut AnyObject = objc2::msg_send![app, delegate];
+        if delegate.is_null() {
+            return;
+        }
+        let class = objc2::ffi::object_getClass(delegate) as *mut objc2::runtime::AnyClass;
+        if class.is_null() {
+            return;
+        }
+        let selector = objc2::sel!(applicationShouldHandleReopen:hasVisibleWindows:);
+        let implementation = std::mem::transmute::<
+            extern "C" fn(
+                *mut AnyObject,
+                objc2::runtime::Sel,
+                *mut AnyObject,
+                objc2::runtime::Bool,
+            ) -> objc2::runtime::Bool,
+            objc2::runtime::Imp,
+        >(fathom_should_handle_reopen);
+        let added = objc2::ffi::class_addMethod(class, selector, implementation, c"B@:@B".as_ptr());
+        if !added.as_bool() {
+            eprintln!("Fathom: platform already owns the reopen handler");
+        }
+    }
+}
+
+/// Returns YES so AppKit treats the Dock / reopen request as handled.
+#[cfg(target_os = "macos")]
+extern "C" fn fathom_should_handle_reopen(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut objc2::runtime::AnyObject,
+    _has_visible_windows: objc2::runtime::Bool,
+) -> objc2::runtime::Bool {
+    show_main_window();
+    objc2::runtime::Bool::YES
+}
+
+#[cfg(target_os = "macos")]
+fn show_main_window() {
+    use std::sync::atomic::Ordering;
+
+    let ptr = MAIN_NSWINDOW.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let nswindow = ptr as *mut objc2::runtime::AnyObject;
+        let nil: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
+        let _: () = objc2::msg_send![nswindow, makeKeyAndOrderFront: nil];
+        let app: *mut objc2::runtime::AnyObject =
+            objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        let _: () = objc2::msg_send![app, activateIgnoringOtherApps: true];
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hide_main_window() {
+    use std::sync::atomic::Ordering;
+
+    let ptr = MAIN_NSWINDOW.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let nswindow = ptr as *mut objc2::runtime::AnyObject;
+        let nil: *mut objc2::runtime::AnyObject = std::ptr::null_mut();
+        let _: () = objc2::msg_send![nswindow, orderOut: nil];
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn begin_window_drag(_window: &Window) {}
 
@@ -6294,6 +9255,48 @@ fn main() {
                         text_input::TextInput::new_compact(cx, "图纸宽度 mm", Some(import_tx))
                             .light()
                     });
+                    let (quote_tx, quote_rx) = mpsc::channel();
+                    let quote_labels = ["人工 ¥/㎡", "辅材 ¥/㎡", "税率 %", "折扣 %"];
+                    let quote_inputs = quote_labels.map(|placeholder| {
+                        cx.new(|cx| {
+                            text_input::TextInput::new_compact(
+                                cx,
+                                placeholder,
+                                Some(quote_tx.clone()),
+                            )
+                            .light()
+                        })
+                    });
+                    let (floor_tx, floor_rx) = mpsc::channel();
+                    let floor_labels = ["楼层名称", "层高 mm"];
+                    let floor_inputs = floor_labels.map(|placeholder| {
+                        cx.new(|cx| {
+                            text_input::TextInput::new_compact(
+                                cx,
+                                placeholder,
+                                Some(floor_tx.clone()),
+                            )
+                            .light()
+                        })
+                    });
+                    let (material_tx, material_rx) = mpsc::channel();
+                    let material_labels = [
+                        "材料名称",
+                        "单价 元/㎡",
+                        "纹理 paint / tile",
+                        "#RRGGBB",
+                        "适用面 floor / wall / ceiling",
+                    ];
+                    let material_inputs = material_labels.map(|placeholder| {
+                        cx.new(|cx| {
+                            text_input::TextInput::new_compact(
+                                cx,
+                                placeholder,
+                                Some(material_tx.clone()),
+                            )
+                            .light()
+                        })
+                    });
                     PlanEditor {
                         surface,
                         state,
@@ -6315,6 +9318,19 @@ fn main() {
                         import_input,
                         import_rx,
                         import_path: None,
+                        import_preview: None,
+                        import_preview_png: None,
+                        quote_open: false,
+                        floor_open: false,
+                        floor_inputs,
+                        material_scroll: 0,
+                        floor_rx,
+                        quote_inputs,
+                        quote_rx,
+                        materials_open: false,
+                        material_edit: None,
+                        material_inputs,
+                        material_rx,
                         library_open: false,
                         library_input,
                         library_rx,
@@ -6323,6 +9339,9 @@ fn main() {
                         favorites_only: false,
                         layers_open: false,
                         right_open: true,
+                        view3d_open: true,
+                        inspector_signature: None,
+                        inspector_collapsed: false,
                         more_open: false,
                         export_open: false,
                         scale_open: false,
@@ -6421,6 +9440,11 @@ fn main() {
                 if std::env::var("FP_UPDATE_SMOKE").is_err() {
                     view.update(cx, |this, cx| this.maybe_check_updates(cx));
                 }
+                if std::env::var("FP_QUOTE_SMOKE").is_ok() {
+                    view.update(cx, |this, cx| this.open_quote(window, cx));
+                }
+                #[cfg(target_os = "macos")]
+                install_window_presence_hooks(window, cx);
                 view
             },
         )

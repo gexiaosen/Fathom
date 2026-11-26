@@ -1,7 +1,7 @@
 //! Soft room fills tinted by the flooring material, drawn under the walls.
 
 use fp_core::EntityId;
-use fp_model::catalog::material_kind_color;
+use fp_model::catalog::{material_color as swatch, material_kind_color};
 use fp_model::{Material, Room};
 
 use crate::batch::{Batch, Color, QuadVertex};
@@ -9,12 +9,11 @@ use crate::camera::Camera2D;
 
 /// Base tint per flooring kind; unknown kinds fall back to neutral grey.
 pub fn material_color(materials: &[Material], room: &Room) -> Color {
-    let kind = room
+    let c = room
         .material_id
         .and_then(|id| materials.iter().find(|m| m.id == id))
-        .map(|m| m.kind.as_str())
-        .unwrap_or("");
-    let c = material_kind_color(kind);
+        .map(swatch)
+        .unwrap_or_else(|| material_kind_color(""));
     Color([c[0], c[1], c[2], 1.0])
 }
 
@@ -74,6 +73,8 @@ mod tests {
             name: "客厅".into(),
             material_id: material_id.map(EntityId),
             counted: true,
+            floor: 0,
+            ceiling_material_id: None,
         }
     }
 
@@ -83,6 +84,10 @@ mod tests {
             name: kind.into(),
             price_per_m2: 0.0,
             kind: kind.into(),
+            color: String::new(),
+            surface: fp_model::FinishSurface::Floor,
+            waste_rate: fp_model::default_waste_rate(),
+            built_in: false,
         }
     }
 
@@ -99,6 +104,17 @@ mod tests {
         let wood = material_color(&mats, &square_room(Some(1)));
         let bare = material_color(&[], &square_room(None));
         assert!(wood.0[0] > bare.0[0], "wood is warmer than the fallback");
+    }
+
+    #[test]
+    fn custom_swatch_overrides_kind_tint() {
+        let mut mats = vec![material(1, "wood")];
+        mats[0].color = "#b4552d".into();
+        let custom = material_color(&mats, &square_room(Some(1)));
+        assert!(custom.0[0] > custom.0[1] && custom.0[1] > custom.0[2]);
+        mats[0].color.clear();
+        let kind = material_color(&mats, &square_room(Some(1)));
+        assert_ne!(custom.0, kind.0);
     }
 
     #[test]

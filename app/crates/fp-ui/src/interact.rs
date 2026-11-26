@@ -12,6 +12,7 @@ pub enum Tool {
     Wall,
     Door,
     Window,
+    Stair,
     Furniture,
     Measure,
     /// Click a non-load-bearing wall to demolish it.

@@ -5,7 +5,7 @@
 
 use fp_core::{EntityId, Mm, Pt};
 
-use crate::Furniture;
+use crate::{Furniture, Material};
 
 /// Coarse grouping used by the furniture library panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -704,24 +704,140 @@ impl Furniture {
             rotation_deg,
             color: spec.color.to_string(),
             room_id: None,
+            price: None,
+            floor: 0,
         }
     }
 }
 
-/// Parse `#rrggbb` into linear-ish sRGB floats; invalid strings fall back grey.
-pub fn hex_color(hex: &str) -> [f32; 3] {
-    let s = hex.trim_start_matches('#');
-    if s.len() != 6 {
-        return [0.6, 0.6, 0.62];
+/// Residential guide price in yuan for a catalogue asset. These are starting
+/// points for the quote, not a supplier price list: every placed piece can be
+/// overridden in the inspector.
+pub fn suggested_price(asset_id: &str) -> f64 {
+    let exact = match asset_id {
+        "sofa" => 3_800.0,
+        "sofa_two" => 2_800.0,
+        "corner_sofa" => 5_200.0,
+        "armchair" => 1_600.0,
+        "coffee_table" => 900.0,
+        "side_table" => 500.0,
+        "tv" => 3_500.0,
+        "tv_stand" => 1_500.0,
+        "rug" => 1_200.0,
+        "floor_lamp" => 600.0,
+        "bookshelf" => 1_800.0,
+        "shoe_cabinet" => 1_500.0,
+        "plant" => 300.0,
+        "bay_cushion" => 300.0,
+        "bean_bag" => 500.0,
+        "bed" => 3_500.0,
+        "bed_single" => 2_200.0,
+        "nightstand" => 700.0,
+        "wardrobe" => 4_500.0,
+        "wardrobe_wide" => 6_500.0,
+        "dresser" => 1_800.0,
+        "bench_bed" => 900.0,
+        "crib" => 1_800.0,
+        "kids_desk" => 1_200.0,
+        "mirror_stand" => 800.0,
+        "dining_table" => 2_500.0,
+        "round_table" => 2_200.0,
+        "chair" => 500.0,
+        "bar_chair" => 600.0,
+        "sideboard" => 2_500.0,
+        "kitchen_island" => 3_500.0,
+        "counter" => 2_000.0,
+        "sink_cabinet" => 1_800.0,
+        "stove" => 2_500.0,
+        "dining_bench" => 900.0,
+        "wine_cabinet" => 3_000.0,
+        "toilet" => 1_500.0,
+        "basin" => 1_200.0,
+        "bathtub" => 3_500.0,
+        "shower" => 2_500.0,
+        "towel_rack" => 400.0,
+        "mirror_cab" => 900.0,
+        "bath_mat" => 150.0,
+        "urinal" => 1_800.0,
+        "laundry_basket" => 200.0,
+        "fridge" => 4_500.0,
+        "fridge_double" => 8_000.0,
+        "washing_machine" => 4_000.0,
+        "dryer" => 3_500.0,
+        "dishwasher" => 4_500.0,
+        "microwave" => 800.0,
+        "water_dispenser" => 1_200.0,
+        "air_purifier" => 1_500.0,
+        "heater" => 800.0,
+        "range_hood" => 2_000.0,
+        "ac" => 4_000.0,
+        "water_heater" => 2_500.0,
+        "ac_wall" => 3_500.0,
+        "oven_column" => 6_000.0,
+        "desk" => 1_500.0,
+        "office_chair" => 1_200.0,
+        "file_cabinet" => 1_000.0,
+        "lounge_chair" => 1_800.0,
+        "piano" => 8_000.0,
+        "treadmill" => 5_000.0,
+        "cat_tree" => 500.0,
+        "chess_table" => 1_500.0,
+        "guitar_stand" => 300.0,
+        _ => 0.0,
+    };
+    if exact > 0.0 {
+        return exact;
     }
-    let parse = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(150) as f32 / 255.0;
-    [parse(0), parse(2), parse(4)]
+    let category = CATALOG
+        .iter()
+        .find(|spec| spec.asset_id == asset_id)
+        .map(|spec| spec.category);
+    match category {
+        Some(FurnitureCategory::Living) => 1_800.0,
+        Some(FurnitureCategory::Bedroom) => 2_200.0,
+        Some(FurnitureCategory::Dining) => 1_500.0,
+        Some(FurnitureCategory::Bath) => 900.0,
+        Some(FurnitureCategory::Appliance) => 3_000.0,
+        Some(FurnitureCategory::Study) => 1_200.0,
+        _ => 800.0,
+    }
+}
+
+/// Parse `#rrggbb` into linear-ish sRGB floats; invalid strings fall back grey.
+pub fn parse_hex_color(hex: &str) -> Option<[f32; 3]> {
+    let s = hex.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let parse = |i: usize| -> Option<f32> {
+        u8::from_str_radix(&s[i..i + 2], 16)
+            .ok()
+            .map(|v| v as f32 / 255.0)
+    };
+    Some([parse(0)?, parse(2)?, parse(4)?])
+}
+
+pub fn hex_color(hex: &str) -> [f32; 3] {
+    parse_hex_color(hex).unwrap_or([0.6, 0.6, 0.62])
+}
+
+/// Colour used by the plan and 3D floor for a material: a custom swatch wins,
+/// otherwise the standard tint for its texture kind.
+pub fn material_color(material: &Material) -> [f32; 3] {
+    parse_hex_color(&material.color).unwrap_or_else(|| material_kind_color(&material.kind))
 }
 
 /// Floor tint per material kind, shared by the plan and the 3D view.
 pub fn material_kind_color(kind: &str) -> [f32; 3] {
     let k = kind.to_ascii_lowercase();
-    if k.contains("walnut") {
+    if k.contains("wallpaper") {
+        [0.74, 0.70, 0.64]
+    } else if k.contains("wood_panel") || k.contains("wood-panel") {
+        [0.52, 0.40, 0.29]
+    } else if k.contains("paint") || k.contains("plaster") {
+        [0.80, 0.78, 0.74]
+    } else if k.contains("walnut") {
         [0.58, 0.42, 0.30]
     } else if k.contains("wood") || k.contains("oak") {
         [0.77, 0.58, 0.39]
@@ -740,6 +856,55 @@ pub fn material_kind_color(kind: &str) -> [f32; 3] {
     }
 }
 
+/// Procedural pattern id understood by the 3D shader. Floor and wall finishes
+/// share the same table so a custom wall finish automatically gets the right
+/// grain or grout grid.
+pub fn finish_pattern(kind: &str) -> f32 {
+    let k = kind.to_ascii_lowercase();
+    if k.contains("wallpaper") {
+        16.0
+    } else if k.contains("wood_panel") || k.contains("wood-panel") {
+        11.0
+    } else if k.contains("paint") || k.contains("plaster") {
+        0.0
+    } else if k.contains("walnut") {
+        1.0
+    } else if k.contains("wood") || k.contains("oak") {
+        2.0
+    } else if k.contains("marble") {
+        3.0
+    } else if k.contains("carpet") {
+        4.0
+    } else if k.contains("terrazzo") {
+        5.0
+    } else if k.contains("tile") || k.contains("ceramic") || k.contains("antislip") {
+        6.0
+    } else if k.contains("stone") {
+        7.0
+    } else {
+        0.0
+    }
+}
+
+/// Approximate shader roughness: paint is nearly matte, tile and stone are
+/// glossier, timber sits in between.
+pub fn finish_roughness(kind: &str) -> f32 {
+    let k = kind.to_ascii_lowercase();
+    if k.contains("paint") || k.contains("plaster") || k.contains("carpet") {
+        1.0
+    } else if k.contains("wallpaper") {
+        0.88
+    } else if k.contains("marble") || k.contains("tile") || k.contains("ceramic") {
+        0.34
+    } else if k.contains("stone") || k.contains("terrazzo") {
+        0.55
+    } else if k.contains("wood") || k.contains("oak") || k.contains("walnut") {
+        0.62
+    } else {
+        0.82
+    }
+}
+
 #[test]
 fn all_tab_lists_the_whole_catalogue() {
     assert_eq!(TABS[0].label(), "全部");
@@ -753,6 +918,26 @@ fn all_tab_lists_the_whole_catalogue() {
 #[cfg(test)]
 mod colour_tests {
     use super::material_kind_color;
+
+    #[test]
+    fn custom_material_colour_wins() {
+        let mut m = crate::Material {
+            id: fp_core::EntityId(1),
+            name: "赤陶".into(),
+            price_per_m2: 0.0,
+            kind: "tile".into(),
+            color: "#b4552d".into(),
+            surface: crate::FinishSurface::Floor,
+            waste_rate: crate::default_waste_rate(),
+            built_in: false,
+        };
+        let c = super::material_color(&m);
+        assert!((c[0] - 0.706).abs() < 0.01, "{c:?}");
+        assert!(c[0] > c[1] && c[1] > c[2]);
+        m.color.clear();
+        let kind = super::material_color(&m);
+        assert_eq!(kind, super::material_kind_color("tile"));
+    }
 
     #[test]
     fn demo_kinds_are_distinct() {

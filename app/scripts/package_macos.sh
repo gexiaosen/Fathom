@@ -6,8 +6,8 @@
 # Finder/AppleScript control is needed and it works headless.
 #
 # Architectures are packaged separately:
-#   dist/Fathom-v0.0.2-arm64.dmg
-#   dist/Fathom-v0.0.2-x86_64.dmg
+#   dist/Fathom-v0.0.6-arm64.dmg
+#   dist/Fathom-v0.0.6-x86_64.dmg
 #
 # Usage:
 #   ./scripts/package_macos.sh
@@ -19,7 +19,7 @@
 #   BIN              cargo binary (default: fp-desktop)
 #   APP_NAME         bundle name (default: Fathom)
 #   BUNDLE_ID        default: app.fathom.desktop
-#   VERSION          default: 0.0.2
+#   VERSION          default: 0.0.14
 #   BUILD_NUMBER     default: 2
 #   MIN_MACOS        deployment target and LSMinimumSystemVersion (default: 11.0)
 #   CARGO            cargo executable; its sibling rustc is put first in PATH
@@ -34,8 +34,8 @@ cd "$(dirname "$0")/.."
 BIN="${BIN:-fp-desktop}"
 APP_NAME="${APP_NAME:-Fathom}"
 BUNDLE_ID="${BUNDLE_ID:-app.fathom.desktop}"
-VERSION="${VERSION:-0.0.2}"
-BUILD_NUMBER="${BUILD_NUMBER:-2}"
+VERSION="${VERSION:-0.0.3}"
+BUILD_NUMBER="${BUILD_NUMBER:-3}"
 MIN_MACOS="${MIN_MACOS:-11.0}"
 MAKE_DMG="${MAKE_DMG:-1}"
 DIST="dist"
@@ -94,6 +94,7 @@ MOUNT=""
 RW_DMG=""
 ICON_TMP=""
 cleanup_dmg() {
+  set +e
   [ -n "${MOUNT:-}" ] && hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true
   [ -n "${VERIFY:-}" ] && hdiutil detach "$VERIFY" -quiet >/dev/null 2>&1 || true
   [ -n "${STAGING:-}" ] && rm -rf "$STAGING"
@@ -102,7 +103,7 @@ cleanup_dmg() {
   [ -n "${RW_DMG:-}" ] && rm -f "$RW_DMG"
   [ -n "${ICON_TMP:-}" ] && rm -f "$ICON_TMP" "$ICON_TMP.rsrc"
 }
-trap cleanup_dmg EXIT
+trap 'status=$?; cleanup_dmg; exit $status' EXIT
 
 package_arch() {
   local arch="$1"

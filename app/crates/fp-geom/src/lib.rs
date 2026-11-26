@@ -4,8 +4,8 @@ pub mod boolean;
 pub mod planar;
 pub mod triangulate;
 
-pub use boolean::{difference, intersection, union};
-pub use planar::detect_rooms;
+pub use boolean::{difference, intersection, union, union_all};
+pub use planar::{ROOM_JOIN_TOLERANCE_MM, detect_rooms};
 pub use triangulate::{triangles_area_m2, triangulate};
 
 use fp_core::{Mm, Pt};

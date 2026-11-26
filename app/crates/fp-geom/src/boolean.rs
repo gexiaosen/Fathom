@@ -4,19 +4,31 @@
 //! geometry, and callers that need them can extend this module later.
 
 use fp_core::Pt;
+use geo::algorithm::bool_ops::unary_union;
 use geo::{BooleanOps, Coord, LineString, MultiPolygon, Polygon};
 
 fn to_geo(points: &[Pt]) -> Option<Polygon<f64>> {
     if points.len() < 3 {
         return None;
     }
-    let coords: Vec<Coord<f64>> = points
+    let mut coords: Vec<Coord<f64>> = points
         .iter()
         .map(|p| Coord {
             x: p.x as f64,
             y: p.y as f64,
         })
         .collect();
+    // Normalise to CCW. `unary_union` picks its fill rule from the first
+    // ring, so mixed windings would make outward offset strips read as holes.
+    let mut area = 0.0;
+    for i in 0..coords.len() {
+        let a = coords[i];
+        let b = coords[(i + 1) % coords.len()];
+        area += a.x * b.y - b.x * a.y;
+    }
+    if area < 0.0 {
+        coords.reverse();
+    }
     Some(Polygon::new(LineString::new(coords), Vec::new()))
 }
 
@@ -41,6 +53,17 @@ pub fn union(a: &[Pt], b: &[Pt]) -> Vec<Vec<Pt>> {
         (None, Some(pb)) => from_multi(&MultiPolygon(vec![pb])),
         (None, None) => Vec::new(),
     }
+}
+
+/// Merge any number of polygons in one boolean pass. Pair-wise unions of a
+/// roof footprint can explode into hundreds of slivers; `unary_union` keeps
+/// the same result and is far faster for room collections.
+pub fn union_all(polys: &[Vec<Pt>]) -> Vec<Vec<Pt>> {
+    let geos: Vec<Polygon<f64>> = polys.iter().filter_map(|p| to_geo(p)).collect();
+    if geos.is_empty() {
+        return Vec::new();
+    }
+    from_multi(&unary_union(&geos))
 }
 
 pub fn intersection(a: &[Pt], b: &[Pt]) -> Vec<Vec<Pt>> {
@@ -110,6 +133,17 @@ mod tests {
         let b = rect(2000, 2000, 6000, 6000);
         let out = difference(&a, &b);
         assert!((area_m2(&out) - 12.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn union_all_merges_rooms_and_keeps_disjoint_parts() {
+        let a = rect(0, 0, 4000, 4000);
+        let b = rect(3900, 0, 6000, 4000);
+        let c = rect(8000, 0, 10000, 3000);
+        let out = union_all(&[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(out.len(), 2, "two touching rooms plus one separate room");
+        let area = area_m2(&out);
+        assert!((area - (24.0 + 6.0)).abs() < 0.05, "merged area {area}");
     }
 
     #[test]

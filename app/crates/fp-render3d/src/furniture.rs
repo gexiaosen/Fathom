@@ -4393,22 +4393,9 @@ fn build_item(
 ) {
     let mut all = Vec::new();
     build_asset(&mut all, frame, &item.asset_id, w, d, h, base);
-    // Soft contact shadow: triangle fan with alpha fading to zero at the
-    // rim, drawn in the blended pass so it grounds the piece without the
-    // hard "puddle" edge a flat disc would give.
-    let seg = 24usize;
-    let cx = frame.map([0.0, 0.004, 0.0]);
-    let color = [0.02, 0.025, 0.04];
-    let mat = [1.0, 0.0, 0.0];
-    for i in 0..seg {
-        let a0 = i as f32 / seg as f32 * std::f32::consts::TAU;
-        let a1 = (i + 1) as f32 / seg as f32 * std::f32::consts::TAU;
-        let r0 = frame.map([w * 0.56 * a0.cos(), 0.004, d * 0.58 * a0.sin()]);
-        let r1 = frame.map([w * 0.56 * a1.cos(), 0.004, d * 0.58 * a1.sin()]);
-        all.push(MeshVertex::with_alpha(cx, [0.0, 1.0, 0.0], color, mat, 0.2));
-        all.push(MeshVertex::with_alpha(r0, [0.0, 1.0, 0.0], color, mat, 0.0));
-        all.push(MeshVertex::with_alpha(r1, [0.0, 1.0, 0.0], color, mat, 0.0));
-    }
+    // No baked elliptical blob: it read as a dark puddle under every piece
+    // and ignored the sun direction. Contact darkening now comes from the
+    // real shadow map plus SSAO, both of which follow geometry and light.
     for v in all {
         if v.alpha >= 1.0 {
             out_opaque.push(v);

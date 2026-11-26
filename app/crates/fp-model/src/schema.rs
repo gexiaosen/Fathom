@@ -36,7 +36,8 @@ pub fn from_json_str(text: &str) -> Result<Document, DocError> {
         migrate(&mut value, found);
     }
 
-    let doc: Document = serde_json::from_value(value)?;
+    let mut doc: Document = serde_json::from_value(value)?;
+    doc.ensure_levels();
     if let Err(issues) = doc.validate() {
         return Err(DocError::Invalid(issues));
     }

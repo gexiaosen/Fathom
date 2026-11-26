@@ -150,6 +150,7 @@ mod tests {
             sill_mm: if kind == OpeningKind::Door { 0 } else { 900 },
             swing_deg: 90.0,
             hinge_right: false,
+            price: None,
         }
     }
 
