@@ -670,7 +670,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    wgpui::blue(),
+                    rgb(0x252b36),
                 )),
             )
         } else {

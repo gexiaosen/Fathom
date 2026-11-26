@@ -5,8 +5,11 @@
 //! framework, appcast, or elevated helper is required.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +17,30 @@ use serde::{Deserialize, Serialize};
 const RELEASE_API: &str = "https://api.github.com/repos/gexiaosen/Fathom/releases/latest";
 const RELEASE_PAGE: &str = "https://github.com/gexiaosen/Fathom/releases/latest";
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Shared download counters read by the update dialog while the blocking
+/// download runs on the background executor.
+#[derive(Debug, Default)]
+pub struct DownloadProgress {
+    downloaded: AtomicU64,
+    total: AtomicU64,
+}
+
+impl DownloadProgress {
+    pub fn snapshot(&self) -> (u64, Option<u64>) {
+        let downloaded = self.downloaded.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        (downloaded, (total > 0).then_some(total))
+    }
+
+    fn set_total(&self, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    fn add(&self, bytes: u64) {
+        self.downloaded.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Release {
@@ -128,7 +155,10 @@ pub fn check_latest() -> Result<Option<Release>, String> {
 /// Downloads the architecture-specific DMG, verifies the app inside it, and
 /// copies the new bundle into the update cache. Blocking: call from the
 /// background executor.
-pub fn download_and_stage(release: &Release) -> Result<PreparedUpdate, String> {
+pub fn download_and_stage(
+    release: &Release,
+    progress: Arc<DownloadProgress>,
+) -> Result<PreparedUpdate, String> {
     if release.asset_name.trim().is_empty() {
         return Err("这个版本没有提供 DMG 安装包，请到 Release 页面手动下载".into());
     }
@@ -147,7 +177,7 @@ pub fn download_and_stage(release: &Release) -> Result<PreparedUpdate, String> {
     let cache = update_cache_dir()?;
     let dmg_path = cache.join(dmg_file_name(release));
     let part_path = dmg_path.with_extension("dmg.part");
-    download_file(&release.download_url, &part_path)?;
+    download_file(&release.download_url, &part_path, &progress)?;
     if part_path != dmg_path {
         let _ = fs::remove_file(&dmg_path);
         fs::rename(&part_path, &dmg_path).map_err(|err| format!("无法保存下载的 DMG：{err}"))?;
@@ -301,7 +331,7 @@ fn dmg_file_name(release: &Release) -> String {
     name.unwrap_or_else(|| format!("Fathom-v{}-update.dmg", release.version))
 }
 
-fn download_file(url: &str, path: &Path) -> Result<(), String> {
+fn download_file(url: &str, path: &Path, progress: &DownloadProgress) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("Fathom/{}", current_version()))
         .timeout(Duration::from_secs(600))
@@ -315,9 +345,23 @@ fn download_file(url: &str, path: &Path) -> Result<(), String> {
     if !response.status().is_success() {
         return Err(format!("下载失败：HTTP {}", response.status().as_u16()));
     }
+    if let Some(total) = response.content_length() {
+        progress.set_total(total);
+    }
 
     let mut file = fs::File::create(path).map_err(|err| format!("无法创建下载文件：{err}"))?;
-    std::io::copy(&mut response, &mut file).map_err(|err| format!("下载中断：{err}"))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|err| format!("下载中断：{err}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|err| format!("写入下载文件失败：{err}"))?;
+        progress.add(read as u64);
+    }
     Ok(())
 }
 
@@ -612,5 +656,16 @@ mod tests {
     fn strips_markdown_markers_from_release_notes() {
         let notes = plain_notes("### 新增\n- **检查更新**\n\n`GitHub Releases`");
         assert_eq!(notes, "新增\n检查更新\nGitHub Releases");
+    }
+
+    #[test]
+    fn download_progress_reports_bytes_and_fraction() {
+        let progress = DownloadProgress::default();
+        assert_eq!(progress.snapshot(), (0, None));
+        progress.set_total(4_000_000);
+        progress.add(1_000_000);
+        assert_eq!(progress.snapshot(), (1_000_000, Some(4_000_000)));
+        progress.set_total(0);
+        assert_eq!(progress.snapshot(), (1_000_000, None));
     }
 }

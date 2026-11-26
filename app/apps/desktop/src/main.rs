@@ -183,6 +183,9 @@ struct PlanEditor {
     window_title: String,
     update_open: bool,
     update_phase: UpdatePhase,
+    /// Byte counters shared with the blocking downloader so the modal can
+    /// repaint a live progress bar without blocking the UI thread.
+    update_progress: Arc<update::DownloadProgress>,
     /// Version offered by the quiet daily check; drives the dot on the More
     /// button and the version hint inside its menu.
     update_available: Option<String>,
@@ -1167,14 +1170,39 @@ impl PlanEditor {
     }
 
     fn start_update_download(&mut self, release: update::Release, cx: &mut Context<Self>) {
+        let progress = Arc::new(update::DownloadProgress::default());
+        self.update_progress = progress.clone();
         self.update_phase = UpdatePhase::Downloading(release.clone());
         cx.notify();
 
         let weak = cx.entity().downgrade();
+        let ticker_weak = weak.clone();
+        cx.spawn(async move |_this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let Some(entity) = ticker_weak.upgrade() else {
+                    break;
+                };
+                let mut downloading = false;
+                let _ = entity.update(cx, |this, cx| {
+                    downloading = matches!(this.update_phase, UpdatePhase::Downloading(_));
+                    if downloading {
+                        cx.notify();
+                    }
+                });
+                if !downloading {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         cx.spawn(async move |_this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { update::download_and_stage(&release) })
+                .spawn(async move { update::download_and_stage(&release, progress) })
                 .await;
 
             let Some(entity) = weak.upgrade() else {
@@ -2536,7 +2564,12 @@ impl Render for PlanEditor {
             })
             .when(help_open, |el| el.child(help_modal(lang, cx)))
             .when(update_open, |el| {
-                el.child(update_modal(update_phase, lang, cx.entity().downgrade()))
+                el.child(update_modal(
+                    update_phase,
+                    self.update_progress.clone(),
+                    lang,
+                    cx.entity().downgrade(),
+                ))
             })
             // ------------------------------------------------------------------
             .on_mouse_down(
@@ -2590,10 +2623,10 @@ const ROW_BG: u32 = 0x2328330d;
 
 const CHROME_BG: u32 = 0xfdfcf9e6;
 const CHROME_BORDER: u32 = 0x23283321;
-const ACCENT: u32 = 0x2f6fed;
+const ACCENT: u32 = 0x252b36;
 const ACCENT_SOFT: u32 = 0x23283314;
 const ACCENT_LINE: u32 = 0x23283333;
-const GOOD: u32 = 0x3d8a61;
+const GOOD: u32 = 0x5f6878;
 const DOT_MUTED: u32 = 0x98a0ad;
 const DANGER: u32 = 0xbd4a41;
 
@@ -3441,6 +3474,7 @@ fn help_modal(lang: i18n::Lang, cx: &mut Context<PlanEditor>) -> impl IntoElemen
 
 fn update_modal(
     phase: UpdatePhase,
+    progress: Arc<update::DownloadProgress>,
     lang: i18n::Lang,
     weak: WeakEntity<PlanEditor>,
 ) -> impl IntoElement {
@@ -3486,11 +3520,11 @@ fn update_modal(
                             .w(px(26.0))
                             .h(px(26.0))
                             .rounded(px(13.0))
-                            .bg(rgba(0x2f8f5b18))
+                            .bg(rgba(0x23283312))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(ui_icon(ICON_CHECK, 14.0, 0x2f8f5b)),
+                            .child(ui_icon(ICON_CHECK, 14.0, GOOD)),
                     )
                     .child(
                         div()
@@ -3609,7 +3643,7 @@ fn update_modal(
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x2f6fed))
+                                .bg(rgb(ACCENT))
                                 .text_xs()
                                 .text_color(rgb(0xffffff))
                                 .child(if has_dmg {
@@ -3633,6 +3667,19 @@ fn update_modal(
                 .into_any_element()
         }
         UpdatePhase::Downloading(release) => {
+            let (done, total) = progress.snapshot();
+            let fraction = total
+                .filter(|total| *total > 0)
+                .map(|total| (done as f32 / total as f32).clamp(0.0, 1.0));
+            let detail = match total {
+                Some(total) if total > 0 => format!(
+                    "{} / {} · {:.0}%",
+                    human_bytes(done),
+                    human_bytes(total),
+                    fraction.unwrap_or(0.0) * 100.0
+                ),
+                _ => human_bytes(done),
+            };
             div()
                 .flex()
                 .flex_col()
@@ -3645,6 +3692,26 @@ fn update_modal(
                         release.version
                     )),
                 ))
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(PANEL_MUTED))
+                        .child(SharedString::from(detail)),
+                )
+                .child(
+                    div()
+                        .h(px(5.0))
+                        .w_full()
+                        .rounded(px(3.0))
+                        .bg(rgba(0x23283312))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(px(460.0 * fraction.unwrap_or(0.0)))
+                                .rounded(px(3.0))
+                                .bg(rgb(ACCENT)),
+                        ),
+                )
                 .child(
                     div()
                         .text_size(px(10.0))
@@ -3674,11 +3741,11 @@ fn update_modal(
                                 .w(px(26.0))
                                 .h(px(26.0))
                                 .rounded(px(13.0))
-                                .bg(rgba(0x2f8f5b18))
+                                .bg(rgba(0x23283312))
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .child(ui_icon(ICON_CHECK, 14.0, 0x2f8f5b)),
+                                .child(ui_icon(ICON_CHECK, 14.0, GOOD)),
                         )
                         .child(
                             div()
@@ -3728,7 +3795,7 @@ fn update_modal(
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x2f6fed))
+                                .bg(rgb(ACCENT))
                                 .text_xs()
                                 .text_color(rgb(0xffffff))
                                 .child(t.s("重启并更新", "Restart & Update"))
@@ -3789,7 +3856,7 @@ fn update_modal(
                             .px_3()
                             .py_1()
                             .rounded_md()
-                            .bg(rgb(0x2f6fed))
+                            .bg(rgb(ACCENT))
                             .text_xs()
                             .text_color(rgb(0xffffff))
                             .child(t.s("重试", "Retry"))
@@ -4045,6 +4112,19 @@ fn inspector_action_is_danger(action: &InspectorAction) -> bool {
             | InspectorAction::RemoveOpening
             | InspectorAction::RemoveFurniture
     )
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value >= MB {
+        format!("{:.1} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.0} KB", value / KB)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn hex_color(hex: &str) -> u32 {
@@ -6208,7 +6288,7 @@ fn view3d_panel(
                 .h_full()
                 .w(px(174.0 * sun_pct))
                 .rounded_full()
-                .bg(rgb(0x2f6fed)),
+                .bg(rgb(ACCENT)),
         )
         .child(
             div()
@@ -7182,7 +7262,7 @@ fn import_modal(
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x2f6fed))
+                        .bg(rgb(ACCENT))
                         .text_xs()
                         .text_color(rgb(0xffffff))
                         .child(t.s("采纳并新建", "Use this plan"))
@@ -7288,7 +7368,7 @@ fn import_modal(
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x2f6fed))
+                        .bg(rgb(ACCENT))
                         .text_xs()
                         .text_color(rgb(0xffffff))
                         .child(t.s("识别并预览", "Detect & preview"))
@@ -8951,7 +9031,7 @@ fn rename_modal(
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(rgb(0x2f6fed))
+                                .bg(rgb(ACCENT))
                                 .text_xs()
                                 .text_color(rgb(0xffffff))
                                 .child(t.s("确定 (Enter)", "OK (Enter)"))
@@ -9355,6 +9435,7 @@ fn main() {
                         window_title: "Fathom 方寸".into(),
                         update_open: false,
                         update_phase: UpdatePhase::Checking,
+                        update_progress: Arc::new(update::DownloadProgress::default()),
                         update_available: None,
                     }
                 });

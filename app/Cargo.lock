@@ -1770,14 +1770,14 @@ dependencies = [
 
 [[package]]
 name = "fp-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "fp-desktop"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "ab_glyph",
  "bytemuck",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "fp-geom"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "earcutr",
  "fp-core",
@@ -1817,14 +1817,14 @@ dependencies = [
 
 [[package]]
 name = "fp-history"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fp-model",
 ]
 
 [[package]]
 name = "fp-model"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fp-core",
  "fp-geom",
