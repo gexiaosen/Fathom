@@ -380,10 +380,9 @@ fn push_finish_row(
     billed_area_m2: f64,
     unit_price: f64,
 ) {
-    if let Some(row) = rows
-        .iter_mut()
-        .find(|row| row.surface == surface && row.name == name && (row.unit_price - unit_price).abs() < 0.01)
-    {
+    if let Some(row) = rows.iter_mut().find(|row| {
+        row.surface == surface && row.name == name && (row.unit_price - unit_price).abs() < 0.01
+    }) {
         row.area_m2 += area_m2;
         row.billed_area_m2 += billed_area_m2;
         row.amount += billed_area_m2 * unit_price;
@@ -617,8 +616,15 @@ mod tests {
         assert!((quote.wall_material - net * 1.08 * 45.0).abs() < 1e-6);
         // 12 m² ceiling × 1.03 × ¥38.
         assert!((quote.ceiling_material - 12.0 * 1.03 * 38.0).abs() < 1e-6);
-        assert!((quote.finish_material - (quote.wall_material + quote.ceiling_material)).abs() < 1e-6);
-        assert!(quote.finish_rows.iter().any(|r| r.surface == "墙面" && r.name == "墙面乳胶漆"));
+        assert!(
+            (quote.finish_material - (quote.wall_material + quote.ceiling_material)).abs() < 1e-6
+        );
+        assert!(
+            quote
+                .finish_rows
+                .iter()
+                .any(|r| r.surface == "墙面" && r.name == "墙面乳胶漆")
+        );
         assert!(quote.finish_rows.iter().any(|r| r.surface == "顶面"));
         let expected = quote.floor_material
             + quote.finish_material

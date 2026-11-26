@@ -6,9 +6,7 @@ use crate::quote::{Quote, money};
 use crate::render3d::Renderer3d;
 use fp_core::{EntityId, Pt};
 use fp_model::catalog::material_color;
-use fp_model::{
-    Document, FinishSurface, Material, OpeningKind, Room, WallFinish, WallKind,
-};
+use fp_model::{Document, FinishSurface, Material, OpeningKind, Room, WallFinish, WallKind};
 use fp_render2d::{Batch, Camera2D};
 use fp_render3d::scene_mesh_full;
 use wgpu::util::DeviceExt;
@@ -482,17 +480,7 @@ fn construction_cover(state: &SceneState, kind: SheetKind) -> Result<(u32, u32, 
                 let top = palette_y + 32.0 + row as f32 * 50.0;
                 let color = material_color(material);
                 fill_rect(&mut rgba, SHEET_W, SHEET_H, x, top, 28.0, 28.0, color, 1.0);
-                stroke_rect(
-                    &mut rgba,
-                    SHEET_W,
-                    SHEET_H,
-                    x,
-                    top,
-                    28.0,
-                    28.0,
-                    1.0,
-                    RULE,
-                );
+                stroke_rect(&mut rgba, SHEET_W, SHEET_H, x, top, 28.0, 28.0, 1.0, RULE);
                 text_left(
                     p,
                     &mut rgba,
@@ -859,9 +847,7 @@ fn construction_floor_sheet(
                     .walls
                     .iter()
                     .filter(|w| w.floor == floor)
-                    .filter(|w| {
-                        wall_finish_material(doc, w).map(|m| m.id) == Some(material.id)
-                    })
+                    .filter(|w| wall_finish_material(doc, w).map(|m| m.id) == Some(material.id))
                     .count();
                 y = draw_finish_material_row(
                     &mut rgba,
@@ -2119,7 +2105,10 @@ fn construction_finish_schedule(
             painter.as_ref(),
             x + 2.0,
             y + 8.0,
-            &format!("另有 {} 间未列出，完整清单见报价 XLSX", doc.rooms.len() - rooms.len()),
+            &format!(
+                "另有 {} 间未列出，完整清单见报价 XLSX",
+                doc.rooms.len() - rooms.len()
+            ),
         );
     }
 
@@ -3757,9 +3746,9 @@ fn wall_finish_material<'a>(doc: &'a Document, wall: &fp_model::Wall) -> Option<
         })
         .or_else(|| {
             let kind = legacy_wall_kind(wall.finish);
-            doc.materials.iter().find(|m| {
-                m.surface == FinishSurface::Wall && m.built_in && m.kind == kind
-            })
+            doc.materials
+                .iter()
+                .find(|m| m.surface == FinishSurface::Wall && m.built_in && m.kind == kind)
         })
 }
 
@@ -3835,8 +3824,8 @@ fn finish_usage_area(doc: &Document, material: &Material) -> f64 {
             .iter()
             .filter(|w| wall_finish_material(doc, w).map(|m| m.id) == Some(material.id))
             .map(|w| {
-                let len = ((w.end.x - w.start.x) as f64).hypot((w.end.y - w.start.y) as f64)
-                    / 1000.0;
+                let len =
+                    ((w.end.x - w.start.x) as f64).hypot((w.end.y - w.start.y) as f64) / 1000.0;
                 len * w.height_mm as f64 / 1000.0
             })
             .sum(),
@@ -6264,11 +6253,7 @@ mod tests {
         let labels: Vec<String> = expected
             .iter()
             .filter_map(|id| {
-                let wall = state
-                    .doc
-                    .walls
-                    .iter()
-                    .find(|w| w.finish_id == Some(*id))?;
+                let wall = state.doc.walls.iter().find(|w| w.finish_id == Some(*id))?;
                 Some(wall_finish_label(&state.doc, wall))
             })
             .collect();
@@ -6276,7 +6261,11 @@ mod tests {
         assert!(labels.iter().all(|label| label.starts_with('W')));
         let finishes = floor_wall_finishes(&state.doc, 0);
         assert!(finishes.len() >= 3);
-        assert!(expected.iter().all(|id| finishes.iter().any(|m| m.id == *id)));
+        assert!(
+            expected
+                .iter()
+                .all(|id| finishes.iter().any(|m| m.id == *id))
+        );
     }
 
     #[test]
@@ -6550,8 +6539,7 @@ mod tests {
             .iter()
             .filter(|w| w.floor == 0)
             .map(|w| {
-                let len = ((w.end.x - w.start.x) as f64)
-                    .hypot((w.end.y - w.start.y) as f64);
+                let len = ((w.end.x - w.start.x) as f64).hypot((w.end.y - w.start.y) as f64);
                 (len, w.id)
             })
             .collect();
@@ -6570,8 +6558,7 @@ mod tests {
             }
         }
         let (w, h, rgba) = construction_sheet(&state, SheetKind::Plan(0)).expect("mixed plan");
-        write_png(Path::new("/tmp/fp-plan-mixed.png"), w, h, &rgba)
-            .expect("write mixed plan");
+        write_png(Path::new("/tmp/fp-plan-mixed.png"), w, h, &rgba).expect("write mixed plan");
     }
 
     #[test]

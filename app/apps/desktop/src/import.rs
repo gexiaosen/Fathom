@@ -105,11 +105,8 @@ pub fn import_floorplan(
         .iter()
         .find(|m| m.surface == fp_model::FinishSurface::Floor)
         .map(|m| m.id);
-    let default_ceiling = crate::templates::built_in_finish_id(
-        &doc,
-        fp_model::FinishSurface::Ceiling,
-        "paint",
-    );
+    let default_ceiling =
+        crate::templates::built_in_finish_id(&doc, fp_model::FinishSurface::Ceiling, "paint");
     for (i, polygon) in detect_rooms(&wall_segments, ROOM_JOIN_TOLERANCE_MM, 0.3)
         .into_iter()
         .enumerate()
@@ -230,11 +227,8 @@ pub fn import_dxf(path: &Path, name: &str) -> Result<ImportOutcome, String> {
         .iter()
         .find(|m| m.surface == fp_model::FinishSurface::Floor)
         .map(|m| m.id);
-    let default_ceiling = crate::templates::built_in_finish_id(
-        &doc,
-        fp_model::FinishSurface::Ceiling,
-        "paint",
-    );
+    let default_ceiling =
+        crate::templates::built_in_finish_id(&doc, fp_model::FinishSurface::Ceiling, "paint");
     for (i, polygon) in detect_rooms(&wall_segments, ROOM_JOIN_TOLERANCE_MM, 0.3)
         .into_iter()
         .enumerate()

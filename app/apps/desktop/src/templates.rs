@@ -6,7 +6,10 @@
 
 use fp_core::{EntityId, Pt};
 use fp_model::catalog::CATALOG;
-use fp_model::{Document, FinishSurface, Furniture, Material, Opening, OpeningKind, Room, Wall, WallFinish, WallKind};
+use fp_model::{
+    Document, FinishSurface, Furniture, Material, Opening, OpeningKind, Room, Wall, WallFinish,
+    WallKind,
+};
 
 use crate::i18n::Lang;
 
@@ -260,11 +263,35 @@ pub const MATERIAL_LIBRARY: [(&str, f64, &str, &str); 6] = [
 /// is the shader/catalogue key, so custom finishes can reuse it.
 pub const FINISH_LIBRARY: [(FinishSurface, &str, f64, &str, &str); 6] = [
     (FinishSurface::Wall, "墙面乳胶漆", 45.0, "paint", "#d0c9bc"),
-    (FinishSurface::Wall, "无纺布壁纸", 80.0, "wallpaper", "#c9c0b1"),
-    (FinishSurface::Wall, "木饰面", 380.0, "wood_panel", "#86664a"),
+    (
+        FinishSurface::Wall,
+        "无纺布壁纸",
+        80.0,
+        "wallpaper",
+        "#c9c0b1",
+    ),
+    (
+        FinishSurface::Wall,
+        "木饰面",
+        380.0,
+        "wood_panel",
+        "#86664a",
+    ),
     (FinishSurface::Wall, "墙砖", 220.0, "tile", "#b9c0bd"),
-    (FinishSurface::Ceiling, "顶面乳胶漆", 38.0, "paint", "#e8e6df"),
-    (FinishSurface::Ceiling, "顶面木饰面", 320.0, "wood_panel", "#7a614b"),
+    (
+        FinishSurface::Ceiling,
+        "顶面乳胶漆",
+        38.0,
+        "paint",
+        "#e8e6df",
+    ),
+    (
+        FinishSurface::Ceiling,
+        "顶面木饰面",
+        320.0,
+        "wood_panel",
+        "#7a614b",
+    ),
 ];
 
 /// Seed the standard palette into a document that has no material library,
@@ -314,7 +341,11 @@ fn ensure_finish_library(doc: &mut Document) {
             kind: kind.into(),
             color: color.into(),
             surface,
-            waste_rate: if surface == FinishSurface::Wall { 0.08 } else { 0.03 },
+            waste_rate: if surface == FinishSurface::Wall {
+                0.08
+            } else {
+                0.03
+            },
             built_in: true,
         });
     }
@@ -347,11 +378,7 @@ fn ensure_finish_library(doc: &mut Document) {
     doc.settings.finish_library_version = 1;
 }
 
-pub fn built_in_finish_id(
-    doc: &Document,
-    surface: FinishSurface,
-    kind: &str,
-) -> Option<EntityId> {
+pub fn built_in_finish_id(doc: &Document, surface: FinishSurface, kind: &str) -> Option<EntityId> {
     doc.materials
         .iter()
         .find(|m| m.built_in && m.surface == surface && m.kind == kind)

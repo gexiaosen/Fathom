@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fp_core::{EntityId, Mm, Pt};
-use fp_geom::{ROOM_JOIN_TOLERANCE_MM, detect_rooms, distance_point_segment, point_in_polygon, snap_to_grid};
+use fp_geom::{
+    ROOM_JOIN_TOLERANCE_MM, detect_rooms, distance_point_segment, point_in_polygon, snap_to_grid,
+};
 use fp_history::{Command, History};
 use fp_model::catalog::{CATALOG, FurnitureCategory};
 use fp_model::{
@@ -1343,14 +1345,13 @@ impl SceneState {
         let tolerance = (WALL_SNAP_PX as f64 / self.cam.scale.max(1e-6)).clamp(160.0, 800.0);
         // Projection is tighter than endpoint capture: a wall drawn parallel
         // 15 cm away should stay parallel, not jump onto its neighbour.
-        let projection_tolerance = (WALL_SNAP_PX as f64 * 0.6 / self.cam.scale.max(1e-6))
-            .clamp(60.0, 500.0);
+        let projection_tolerance =
+            (WALL_SNAP_PX as f64 * 0.6 / self.cam.scale.max(1e-6)).clamp(60.0, 500.0);
         let mut best: Option<(f64, Pt)> = None;
 
         for wall in &walls {
             for candidate in [wall.start, wall.end] {
-                let distance =
-                    ((raw.x - candidate.x) as f64).hypot((raw.y - candidate.y) as f64);
+                let distance = ((raw.x - candidate.x) as f64).hypot((raw.y - candidate.y) as f64);
                 if distance <= tolerance
                     && best.is_none_or(|(best_distance, _)| distance < best_distance)
                 {
@@ -1373,8 +1374,7 @@ impl SceneState {
             if len_sq < 1.0 {
                 continue;
             }
-            let t = (((raw.x - wall.start.x) as f64) * dx
-                + ((raw.y - wall.start.y) as f64) * dy)
+            let t = (((raw.x - wall.start.x) as f64) * dx + ((raw.y - wall.start.y) as f64) * dy)
                 / len_sq;
             if !(0.0..=1.0).contains(&t) {
                 continue;
@@ -1383,8 +1383,7 @@ impl SceneState {
                 (wall.start.x as f64 + dx * t).round() as Mm,
                 (wall.start.y as f64 + dy * t).round() as Mm,
             );
-            let distance =
-                ((raw.x - projection.x) as f64).hypot((raw.y - projection.y) as f64);
+            let distance = ((raw.x - projection.x) as f64).hypot((raw.y - projection.y) as f64);
             if distance <= projection_tolerance
                 && best.is_none_or(|(best_distance, _)| distance < best_distance)
             {
@@ -3376,12 +3375,7 @@ impl SceneState {
             count += 1;
             area += fp_geom::area(&room.polygon) / 1_000_000.0;
         }
-        for wall in self
-            .doc
-            .walls
-            .iter()
-            .filter(|w| w.finish_id == Some(id))
-        {
+        for wall in self.doc.walls.iter().filter(|w| w.finish_id == Some(id)) {
             count += 1;
             let length_mm =
                 ((wall.end.x - wall.start.x) as f64).hypot((wall.end.y - wall.start.y) as f64);
@@ -5096,7 +5090,10 @@ impl SceneState {
                 return Some(InspectorView {
                     title: r.name.clone(),
                     subtitle: t
-                        .f("房间 · 地面/顶面饰面与造价", "Room · floor & ceiling finishes")
+                        .f(
+                            "房间 · 地面/顶面饰面与造价",
+                            "Room · floor & ceiling finishes",
+                        )
                         .into(),
                     kind: InspectorKind::Room,
                     fields,
@@ -5225,9 +5222,7 @@ impl SceneState {
                 ceiling_options: Vec::new(),
                 wall_kind: None,
                 wall_finish: None,
-                actions: vec![
-                    (t.s("批量删除", "Delete all"), InspectorAction::RemoveWall),
-                ],
+                actions: vec![(t.s("批量删除", "Delete all"), InspectorAction::RemoveWall)],
             });
         }
         None
@@ -5440,9 +5435,10 @@ impl SceneState {
     }
 
     fn apply_wall_finish_to_floor(&mut self) {
-        let Some(wall) = self.selected_wall_id().and_then(|id| {
-            self.doc.walls.iter().find(|w| w.id == id)
-        }) else {
+        let Some(wall) = self
+            .selected_wall_id()
+            .and_then(|id| self.doc.walls.iter().find(|w| w.id == id))
+        else {
             return;
         };
         let floor = wall.floor;
@@ -5484,10 +5480,8 @@ impl SceneState {
         if before == after {
             return;
         }
-        self.history.execute(
-            Box::new(SetWallFinishes { before, after }),
-            &mut self.doc,
-        );
+        self.history
+            .execute(Box::new(SetWallFinishes { before, after }), &mut self.doc);
         self.touch();
     }
 
@@ -7256,9 +7250,13 @@ mod tests {
         let mut s = room_state();
         let existing_end = s.doc.walls[0].end;
         s.set_tool(Tool::Wall);
-        let start = s.cam.world_to_screen(Pt::new(existing_end.x, existing_end.y + 35));
+        let start = s
+            .cam
+            .world_to_screen(Pt::new(existing_end.x, existing_end.y + 35));
         s.pointer_down(start, PointerButton::Left, false);
-        let end = s.cam.world_to_screen(Pt::new(existing_end.x + 2000, existing_end.y));
+        let end = s
+            .cam
+            .world_to_screen(Pt::new(existing_end.x + 2000, existing_end.y));
         s.pointer_down(end, PointerButton::Left, false);
         assert_eq!(s.doc.walls.len(), 5);
         let added = s.doc.walls.last().unwrap();

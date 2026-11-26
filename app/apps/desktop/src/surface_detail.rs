@@ -74,7 +74,14 @@ pub fn create(device: &wgpu::Device, queue: &wgpu::Queue) -> SurfaceDetail {
             if level > 0 {
                 albedo_maps[layer] = downsample_rgba(&albedo_maps[layer], size * 2);
             }
-            upload_albedo(queue, &albedo, layer as u32, level, size, &albedo_maps[layer]);
+            upload_albedo(
+                queue,
+                &albedo,
+                layer as u32,
+                level,
+                size,
+                &albedo_maps[layer],
+            );
         }
     }
     let albedo_view = albedo.create_view(&wgpu::TextureViewDescriptor {
@@ -430,11 +437,20 @@ mod tests {
         for layer in 0..ALBEDO_LAYERS {
             let pixels = albedo_map(layer, 96);
             let lo = pixels.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
-            let hi = pixels.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+            let hi = pixels
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::NEG_INFINITY, f32::max);
             let rlo = pixels.iter().map(|p| p[3]).fold(f32::INFINITY, f32::min);
-            let rhi = pixels.iter().map(|p| p[3]).fold(f32::NEG_INFINITY, f32::max);
+            let rhi = pixels
+                .iter()
+                .map(|p| p[3])
+                .fold(f32::NEG_INFINITY, f32::max);
             assert!(hi - lo > 0.015, "layer {layer} albedo is flat: {lo}..{hi}");
-            assert!(rhi - rlo > 0.005, "layer {layer} roughness is flat: {rlo}..{rhi}");
+            assert!(
+                rhi - rlo > 0.005,
+                "layer {layer} roughness is flat: {rlo}..{rhi}"
+            );
         }
     }
 

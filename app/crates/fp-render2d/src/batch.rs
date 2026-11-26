@@ -273,14 +273,18 @@ mod tests {
         b.end = Pt::new(1000, 2000);
         b.finish_id = Some(EntityId(202));
         let batch = build_wall_finish_batch(&[a, b], &materials, &cam, true);
-        assert!(batch
-            .vertices
-            .iter()
-            .any(|v| v.color[0] == 1.0 && v.color[1] == 0.0));
-        assert!(batch
-            .vertices
-            .iter()
-            .any(|v| v.color[1] == 1.0 && v.color[0] == 0.0));
+        assert!(
+            batch
+                .vertices
+                .iter()
+                .any(|v| v.color[0] == 1.0 && v.color[1] == 0.0)
+        );
+        assert!(
+            batch
+                .vertices
+                .iter()
+                .any(|v| v.color[1] == 1.0 && v.color[0] == 0.0)
+        );
     }
 
     #[test]

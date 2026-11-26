@@ -972,8 +972,7 @@ impl PlanEditor {
         };
         let surface_raw = self.material_inputs[4].read(cx).text();
         let Some(surface) = fp_model::FinishSurface::parse(&surface_raw) else {
-            self.state.lock().unwrap().note =
-                Some("适用面需为 floor / wall / ceiling".into());
+            self.state.lock().unwrap().note = Some("适用面需为 floor / wall / ceiling".into());
             cx.notify();
             return;
         };
@@ -1859,17 +1858,13 @@ impl Render for PlanEditor {
             })
             // ------------------------------------------------------------------
             // Inspector: only visible when there is an actual selection.
-            .child(
-                div()
-                    .absolute()
-                    .top(px(62.0))
-                    .right(px(14.0))
-                    .children(if self.inspector_shown {
-                        inspector.map(|view| inspector_panel(view, wall_kind_open, lang, cx))
-                    } else {
-                        None
-                    }),
-            )
+            .child(div().absolute().top(px(62.0)).right(px(14.0)).children(
+                if self.inspector_shown {
+                    inspector.map(|view| inspector_panel(view, wall_kind_open, lang, cx))
+                } else {
+                    None
+                },
+            ))
             .child(
                 div()
                     .absolute()
@@ -4101,10 +4096,7 @@ fn finish_action_chips(
                 .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                     if let Some(entity) = state.upgrade() {
                         entity.update(cx, |this, cx| {
-                            this.state
-                                .lock()
-                                .unwrap()
-                                .apply_action(action_for(id));
+                            this.state.lock().unwrap().apply_action(action_for(id));
                             cx.notify();
                         });
                     }

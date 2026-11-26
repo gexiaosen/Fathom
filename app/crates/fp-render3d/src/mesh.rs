@@ -997,7 +997,9 @@ fn quad(
 #[cfg(test)]
 mod tests {
     use fp_core::{EntityId, Pt};
-    use fp_model::{FinishSurface, Material, Opening, OpeningKind, Room, Wall, WallFinish, WallKind};
+    use fp_model::{
+        FinishSurface, Material, Opening, OpeningKind, Room, Wall, WallFinish, WallKind,
+    };
 
     use super::*;
 

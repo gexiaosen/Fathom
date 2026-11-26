@@ -750,7 +750,10 @@ mod tests {
             ceiling_material_id: None,
         });
         let mut value: serde_json::Value = serde_json::from_str(&doc.to_json().unwrap()).unwrap();
-        value["walls"][0].as_object_mut().unwrap().remove("finish_id");
+        value["walls"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("finish_id");
         value["rooms"][0]
             .as_object_mut()
             .unwrap()

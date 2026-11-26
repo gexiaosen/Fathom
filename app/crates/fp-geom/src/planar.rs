@@ -234,7 +234,9 @@ fn weld_segments(segments: &[(Pt, Pt)], tolerance_mm: Mm) -> Vec<(Pt, Pt)> {
 }
 
 fn cluster_len(parent: &[usize], root: usize) -> usize {
-    (0..parent.len()).filter(|&i| find_root(parent, i) == root).count()
+    (0..parent.len())
+        .filter(|&i| find_root(parent, i) == root)
+        .count()
 }
 
 fn find_root(parent: &[usize], mut index: usize) -> usize {
@@ -244,12 +246,7 @@ fn find_root(parent: &[usize], mut index: usize) -> usize {
     index
 }
 
-fn project_endpoint(
-    p: Pt,
-    own_segment: usize,
-    segments: &[(Pt, Pt)],
-    tolerance: f64,
-) -> Pt {
+fn project_endpoint(p: Pt, own_segment: usize, segments: &[(Pt, Pt)], tolerance: f64) -> Pt {
     let mut best = p;
     let mut best_distance = tolerance;
     for (index, (a, b)) in segments.iter().enumerate() {
@@ -285,7 +282,8 @@ fn project_to_segment(p: Pt, a: Pt, b: Pt) -> Pt {
     )
 }
 
-fn signed_area_f64(points: &[Pt]) -> f64 {    if points.len() < 3 {
+fn signed_area_f64(points: &[Pt]) -> f64 {
+    if points.len() < 3 {
         return 0.0;
     }
     let mut sum = 0.0;
@@ -454,7 +452,11 @@ mod tests {
         // just inside the first rather than exactly on its end.
         segs[3].1 = Pt::new(80, 80);
         let rooms = detect_rooms(&segs, ROOM_JOIN_TOLERANCE_MM, 0.3);
-        assert_eq!(rooms.len(), 1, "small drafting gap should not erase the room");
+        assert_eq!(
+            rooms.len(),
+            1,
+            "small drafting gap should not erase the room"
+        );
     }
 
     #[test]

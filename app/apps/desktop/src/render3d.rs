@@ -1157,8 +1157,7 @@ fn create_depth(
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&Default::default())
@@ -1229,11 +1228,7 @@ fn create_opaque(
         .create_view(&Default::default())
 }
 
-
-fn create_normal_msaa(
-    device: &wgpu::Device,
-    (width, height): (u32, u32),
-) -> wgpu::TextureView {
+fn create_normal_msaa(device: &wgpu::Device, (width, height): (u32, u32)) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("scene3d normal msaa"),
@@ -1252,10 +1247,7 @@ fn create_normal_msaa(
         .create_view(&Default::default())
 }
 
-fn create_normal_resolve(
-    device: &wgpu::Device,
-    (width, height): (u32, u32),
-) -> wgpu::TextureView {
+fn create_normal_resolve(device: &wgpu::Device, (width, height): (u32, u32)) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("scene3d normal resolve"),
@@ -1268,8 +1260,7 @@ fn create_normal_resolve(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: NORMAL_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&Default::default())
