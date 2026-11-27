@@ -8,8 +8,8 @@ cd app
 ```
 
 - `dist/Fathom-arm64.app` / `dist/Fathom-x86_64.app`
-- `dist/Fathom-v0.0.1-arm64.dmg` / `dist/Fathom-v0.0.1-x86_64.dmg`
-- 版本：`CFBundleShortVersionString=0.0.1`，`CFBundleVersion=1`
+- `dist/Fathom-v0.0.4-arm64.dmg` / `dist/Fathom-v0.0.4-x86_64.dmg`
+- 版本：`CFBundleShortVersionString=0.0.4`，`CFBundleVersion=4`
 - 架构：arm64 与 x86_64 分开打包，不做 Universal 合并
 - 最低系统：macOS 11.0
 

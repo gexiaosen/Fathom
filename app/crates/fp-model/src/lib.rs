@@ -542,6 +542,10 @@ pub struct DocSettings {
     pub grid_mm: i32,
     pub snap: bool,
     pub show_dimensions: bool,
+    /// Per-side dimension chains outside the plan outline. Independent of
+    /// `show_dimensions`, which controls the small length label on each wall.
+    #[serde(default = "default_true")]
+    pub show_dimension_chains: bool,
     #[serde(default = "default_true")]
     pub show_room_names: bool,
     #[serde(default = "default_true")]
@@ -552,6 +556,11 @@ pub struct DocSettings {
     pub show_bearing: bool,
     #[serde(default = "default_true")]
     pub show_underlay: bool,
+    /// Imported plans can carry authored room polygons while their wall
+    /// strokes are too fragmented for `detect_rooms`. Keep those rooms when a
+    /// wall edit cannot rebuild the graph instead of clearing the whole plan.
+    #[serde(default)]
+    pub keep_authored_rooms: bool,
     /// 1 once the built-in wall/ceiling finishes have been added to an old
     /// document. Kept in the document so opening a plan does not resurrect
     /// finishes the user deleted later.
@@ -594,11 +603,13 @@ impl Default for DocSettings {
             grid_mm: 10,
             snap: true,
             show_dimensions: true,
+            show_dimension_chains: true,
             show_room_names: true,
             show_furniture: true,
             show_grid: true,
             show_bearing: true,
             show_underlay: true,
+            keep_authored_rooms: false,
             finish_library_version: 0,
         }
     }

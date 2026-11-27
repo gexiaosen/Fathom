@@ -6,8 +6,8 @@
 # Finder/AppleScript control is needed and it works headless.
 #
 # Architectures are packaged separately:
-#   dist/Fathom-v0.0.3-arm64.dmg
-#   dist/Fathom-v0.0.3-x86_64.dmg
+#   dist/Fathom-v0.0.4-arm64.dmg
+#   dist/Fathom-v0.0.4-x86_64.dmg
 #
 # Usage:
 #   ./scripts/package_macos.sh
@@ -34,7 +34,7 @@ cd "$(dirname "$0")/.."
 BIN="${BIN:-fp-desktop}"
 APP_NAME="${APP_NAME:-Fathom}"
 BUNDLE_ID="${BUNDLE_ID:-app.fathom.desktop}"
-VERSION="${VERSION:-0.0.3}"
+VERSION="${VERSION:-0.0.4}"
 BUILD_NUMBER="${BUILD_NUMBER:-3}"
 MIN_MACOS="${MIN_MACOS:-11.0}"
 MAKE_DMG="${MAKE_DMG:-1}"

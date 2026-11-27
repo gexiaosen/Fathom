@@ -1,5 +1,6 @@
 //! Editor state: document, history, camera and every pointer/keyboard gesture.
 
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -51,6 +52,179 @@ use fp_ui::{
 use glam::{Vec3, Vec4};
 
 use crate::underlay::{UnderlayDraw, UnderlayImage};
+
+const WALL_COLLINEAR_COS: f64 = 0.9994; // about 2 degrees
+const WALL_JOIN_GAP_MM: f64 = 8.0;
+const WALL_MIN_PIECE_MM: f64 = 60.0;
+
+/// Direction and length of a wall centreline in millimetres.
+fn wall_axis(wall: &Wall) -> Option<(f64, f64, f64)> {
+    let dx = (wall.end.x - wall.start.x) as f64;
+    let dy = (wall.end.y - wall.start.y) as f64;
+    let len = dx.hypot(dy);
+    if len < 1.0 {
+        return None;
+    }
+    Some((dx / len, dy / len, len))
+}
+
+fn perpendicular_offset(point: Pt, origin: Pt, ux: f64, uy: f64) -> f64 {
+    (point.x - origin.x) as f64 * -uy + (point.y - origin.y) as f64 * ux
+}
+
+fn wall_spec_compatible(a: &Wall, b: &Wall) -> bool {
+    a.floor == b.floor
+        && a.kind == b.kind
+        && a.thickness_mm == b.thickness_mm
+        && a.height_mm == b.height_mm
+        && a.finish == b.finish
+        && a.finish_id == b.finish_id
+}
+
+fn wall_overlap(a: &Wall, b: &Wall) -> Option<(f64, f64)> {
+    let (aux, auy, alen) = wall_axis(a)?;
+    let (bux, buy, _) = wall_axis(b)?;
+    if (aux * bux + auy * buy).abs() < WALL_COLLINEAR_COS {
+        return None;
+    }
+    let tolerance = ((a.thickness_mm + b.thickness_mm) as f64 * 0.4).clamp(20.0, 120.0);
+    if perpendicular_offset(b.start, a.start, aux, auy).abs() > tolerance
+        || perpendicular_offset(b.end, a.start, aux, auy).abs() > tolerance
+    {
+        return None;
+    }
+    let t0 = (b.start.x - a.start.x) as f64 * aux + (b.start.y - a.start.y) as f64 * auy;
+    let t1 = (b.end.x - a.start.x) as f64 * aux + (b.end.y - a.start.y) as f64 * auy;
+    let start = t0.min(t1).max(0.0);
+    let end = t0.max(t1).min(alen);
+    (end - start > 0.5).then_some((start, end))
+}
+
+fn merge_intervals(mut intervals: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for (start, end) in intervals {
+        if let Some(last) = out.last_mut()
+            && start <= last.1 + 0.5
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        out.push((start, end));
+    }
+    out
+}
+
+fn near_point(a: Pt, b: Pt, tolerance: f64) -> bool {
+    (a.x - b.x).abs() as f64 <= tolerance && (a.y - b.y).abs() as f64 <= tolerance
+}
+
+fn point_on_wall(start: Pt, ux: f64, uy: f64, distance: f64) -> Pt {
+    Pt::new(
+        (start.x as f64 + ux * distance).round() as i32,
+        (start.y as f64 + uy * distance).round() as i32,
+    )
+}
+
+/// Clip a new wall against every collinear wall already on the floor, then
+/// merge touching collinear walls that have no openings. Returning the whole
+/// floor lets one history command cover the trim and the merge atomically.
+fn normalize_wall_addition(
+    before: &[Wall],
+    candidate: Wall,
+    openings: &[Opening],
+    next_id: &mut u128,
+) -> Vec<Wall> {
+    let mut walls = before.to_vec();
+    let mut covered = Vec::new();
+    for wall in before.iter().filter(|w| w.floor == candidate.floor) {
+        if let Some((start, end)) = wall_overlap(&candidate, wall) {
+            covered.push((start, end));
+        }
+    }
+    covered = merge_intervals(covered);
+
+    if let Some((ux, uy, len)) = wall_axis(&candidate) {
+        let mut cursor = 0.0;
+        let mut pieces = Vec::new();
+        for (start, end) in covered {
+            if start > cursor + 0.5 {
+                pieces.push((cursor, start));
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < len - 0.5 {
+            pieces.push((cursor, len));
+        }
+        for (start, end) in pieces {
+            if end - start < WALL_MIN_PIECE_MM {
+                continue;
+            }
+            let mut piece = candidate.clone();
+            piece.id = EntityId(*next_id);
+            *next_id += 1;
+            piece.start = point_on_wall(candidate.start, ux, uy, start);
+            piece.end = point_on_wall(candidate.start, ux, uy, end);
+            walls.push(piece);
+        }
+    }
+
+    let opening_walls: HashSet<EntityId> = openings.iter().map(|o| o.wall_id).collect();
+    merge_collinear_walls(walls, &opening_walls)
+}
+
+fn merge_collinear_walls(mut walls: Vec<Wall>, opening_walls: &HashSet<EntityId>) -> Vec<Wall> {
+    for _ in 0..64 {
+        let mut pair = None;
+        'search: for i in 0..walls.len() {
+            if opening_walls.contains(&walls[i].id) {
+                continue;
+            }
+            for j in (i + 1)..walls.len() {
+                if opening_walls.contains(&walls[j].id)
+                    || !wall_spec_compatible(&walls[i], &walls[j])
+                {
+                    continue;
+                }
+                let Some((aux, auy, alen)) = wall_axis(&walls[i]) else {
+                    continue;
+                };
+                let Some((bux, buy, _)) = wall_axis(&walls[j]) else {
+                    continue;
+                };
+                if (aux * bux + auy * buy).abs() < WALL_COLLINEAR_COS {
+                    continue;
+                }
+                let tolerance = ((walls[i].thickness_mm + walls[j].thickness_mm) as f64 * 0.4)
+                    .clamp(20.0, 120.0);
+                if perpendicular_offset(walls[j].start, walls[i].start, aux, auy).abs() > tolerance
+                    || perpendicular_offset(walls[j].end, walls[i].start, aux, auy).abs()
+                        > tolerance
+                {
+                    continue;
+                }
+                let t0 = (walls[j].start.x - walls[i].start.x) as f64 * aux
+                    + (walls[j].start.y - walls[i].start.y) as f64 * auy;
+                let t1 = (walls[j].end.x - walls[i].start.x) as f64 * aux
+                    + (walls[j].end.y - walls[i].start.y) as f64 * auy;
+                let (b0, b1) = (t0.min(t1), t0.max(t1));
+                if b1 < -WALL_JOIN_GAP_MM || b0 > alen + WALL_JOIN_GAP_MM {
+                    continue;
+                }
+                pair = Some((i, j, (aux, auy), b0.min(0.0), b1.max(alen)));
+                break 'search;
+            }
+        }
+        let Some((i, j, (ux, uy), start, end)) = pair else {
+            break;
+        };
+        let origin = walls[i].start;
+        walls[i].start = point_on_wall(origin, ux, uy, start);
+        walls[i].end = point_on_wall(origin, ux, uy, end);
+        walls.remove(j);
+    }
+    walls
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
@@ -358,8 +532,233 @@ pub fn pick_scene_at(
 
 pub struct PlanLabel {
     pub text: String,
+    /// Optional second line under the main text (room area).
+    pub sub: Option<String>,
     pub pos: [f32; 2],
     pub bold: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DimSide {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+struct DimensionChain {
+    side: DimSide,
+    horizontal: bool,
+    line: f32,
+    total_line: f32,
+    edge: f32,
+    start: f32,
+    end: f32,
+    segments: Vec<(f32, f32, f64)>,
+    total_mm: f64,
+}
+
+impl DimensionChain {
+    fn mid(&self) -> f32 {
+        (self.start + self.end) * 0.5
+    }
+}
+
+/// Build the four-side dimension chains from the storey's wall centrelines.
+/// A wall belongs to the side nearest its midpoint, so corners are not counted
+/// twice. Overlapping wall intervals are unioned before the chain is drawn.
+fn dimension_chains(walls: &[Wall], cam: &Camera2D) -> Vec<DimensionChain> {
+    if walls.is_empty() {
+        return Vec::new();
+    }
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for wall in walls {
+        for p in [wall.start, wall.end] {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+    }
+    let span_x = (max_x - min_x) as f64;
+    let span_y = (max_y - min_y) as f64;
+    if span_x < 1.0 && span_y < 1.0 {
+        return Vec::new();
+    }
+    let a = cam.world_to_screen(Pt::new(min_x, min_y));
+    let b = cam.world_to_screen(Pt::new(max_x, max_y));
+    let screen_left = a[0].min(b[0]);
+    let screen_right = a[0].max(b[0]);
+    let screen_top = a[1].min(b[1]);
+    let screen_bottom = a[1].max(b[1]);
+
+    let mut chains = Vec::new();
+    for side in [DimSide::Top, DimSide::Bottom, DimSide::Left, DimSide::Right] {
+        let horizontal = matches!(side, DimSide::Top | DimSide::Bottom);
+        let mut intervals: Vec<(f32, f32)> = Vec::new();
+        for wall in walls {
+            let dx = (wall.end.x - wall.start.x).abs();
+            let dy = (wall.end.y - wall.start.y).abs();
+            if (horizontal && dx < dy) || (!horizontal && dy <= dx) {
+                continue;
+            }
+            let mx = (wall.start.x + wall.end.x) as f64 * 0.5;
+            let my = (wall.start.y + wall.end.y) as f64 * 0.5;
+            let keep = match side {
+                DimSide::Top => my <= min_y as f64 + span_y * 0.3,
+                DimSide::Bottom => my >= max_y as f64 - span_y * 0.3,
+                DimSide::Left => mx <= min_x as f64 + span_x * 0.3,
+                DimSide::Right => mx >= max_x as f64 - span_x * 0.3,
+            };
+            if !keep {
+                continue;
+            }
+            let p = cam.world_to_screen(wall.start);
+            let q = cam.world_to_screen(wall.end);
+            let (start, end) = if horizontal {
+                (p[0].min(q[0]), p[0].max(q[0]))
+            } else {
+                (p[1].min(q[1]), p[1].max(q[1]))
+            };
+            if end - start >= 1.0 {
+                intervals.push((start, end));
+            }
+        }
+        intervals.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut merged: Vec<(f32, f32)> = Vec::new();
+        for (start, end) in intervals {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1 + 1.5
+            {
+                last.1 = last.1.max(end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        if merged.is_empty() {
+            continue;
+        }
+        let start = merged.first().map(|s| s.0).unwrap_or(0.0);
+        let end = merged.last().map(|s| s.1).unwrap_or(0.0);
+        if end - start < 60.0 {
+            continue;
+        }
+        let total_mm: f64 = merged
+            .iter()
+            .map(|(s, e)| ((e - s) as f64 / cam.scale.max(1.0e-4)) as f64)
+            .sum();
+        let line = match side {
+            DimSide::Top => (screen_top - 30.0).max(8.0),
+            DimSide::Bottom => (screen_bottom + 30.0).min(cam.viewport[1] - 8.0),
+            DimSide::Left => (screen_left - 30.0).max(8.0),
+            DimSide::Right => (screen_right + 30.0).min(cam.viewport[0] - 8.0),
+        };
+        let total_line = match side {
+            DimSide::Top => (line - 20.0).max(6.0),
+            DimSide::Bottom => (line + 20.0).min(cam.viewport[1] - 6.0),
+            DimSide::Left => (line - 20.0).max(6.0),
+            DimSide::Right => (line + 20.0).min(cam.viewport[0] - 6.0),
+        };
+        let edge = match side {
+            DimSide::Top => screen_top,
+            DimSide::Bottom => screen_bottom,
+            DimSide::Left => screen_left,
+            DimSide::Right => screen_right,
+        };
+        let segments = merged
+            .into_iter()
+            .map(|(s, e)| (s, e, (e - s) as f64 / cam.scale.max(1.0e-4)))
+            .collect();
+        chains.push(DimensionChain {
+            side,
+            horizontal,
+            line,
+            total_line,
+            edge,
+            start,
+            end,
+            segments,
+            total_mm,
+        });
+    }
+    chains
+}
+
+fn draw_dimension_chains(batch: &mut Batch, chains: &[DimensionChain]) {
+    let color = Color([0.30, 0.33, 0.40, 0.72]);
+    let tick = 5.0;
+    for chain in chains {
+        if chain.horizontal {
+            push_screen_line(
+                batch,
+                [chain.start, chain.line],
+                [chain.end, chain.line],
+                1.0,
+                color,
+            );
+            push_screen_line(
+                batch,
+                [chain.start, chain.total_line],
+                [chain.end, chain.total_line],
+                1.0,
+                color,
+            );
+            for (start, end, _) in &chain.segments {
+                for x in [*start, *end] {
+                    push_screen_line(
+                        batch,
+                        [x, chain.line - tick],
+                        [x, chain.line + tick],
+                        1.0,
+                        color,
+                    );
+                    push_screen_line(
+                        batch,
+                        [x, chain.edge.min(chain.total_line)],
+                        [x, chain.edge.max(chain.total_line)],
+                        0.8,
+                        color,
+                    );
+                }
+            }
+        } else {
+            push_screen_line(
+                batch,
+                [chain.line, chain.start],
+                [chain.line, chain.end],
+                1.0,
+                color,
+            );
+            push_screen_line(
+                batch,
+                [chain.total_line, chain.start],
+                [chain.total_line, chain.end],
+                1.0,
+                color,
+            );
+            for (start, end, _) in &chain.segments {
+                for y in [*start, *end] {
+                    push_screen_line(
+                        batch,
+                        [chain.line - tick, y],
+                        [chain.line + tick, y],
+                        1.0,
+                        color,
+                    );
+                    push_screen_line(
+                        batch,
+                        [chain.edge.min(chain.total_line), y],
+                        [chain.edge.max(chain.total_line), y],
+                        0.8,
+                        color,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Cloned entities waiting to be pasted.
@@ -377,7 +776,7 @@ impl Clipboard {
 }
 
 /** Wall length and unit direction along the wall. */
-fn wall_axis(w: &Wall) -> (f64, f64, f64) {
+fn wall_axis_signed(w: &Wall) -> (f64, f64, f64) {
     let dx = (w.end.x - w.start.x) as f64;
     let dy = (w.end.y - w.start.y) as f64;
     let len = (dx * dx + dy * dy).sqrt();
@@ -444,6 +843,7 @@ pub enum Layer {
     Furniture,
     Grid,
     Dimensions,
+    DimensionChains,
     Bearing,
     Underlay,
 }
@@ -503,7 +903,14 @@ pub struct SceneState {
     placing: Option<PlaceDrag>,
     opening_drag: Option<OpeningDrag>,
     pub hover: Option<EntityId>,
+    /// Opening under the cursor. Kept separate from `hover` (walls) so a window
+    /// never paints the host wall blue while the pointer sits on it.
+    pub hover_opening: Option<EntityId>,
     pub drag: Option<DragSession>,
+    /// Original storey walls/openings while a wall is being dragged, used to
+    /// keep adjoining walls attached instead of opening every room boundary.
+    wall_drag_walls: Option<Vec<Wall>>,
+    wall_drag_openings: Option<Vec<Opening>>,
     pub pan: Option<[f32; 2]>,
     pub draft: Option<Pt>,
     /// True between press and release of a wall stroke.
@@ -549,19 +956,42 @@ pub struct SceneState {
 
 impl SceneState {
     pub fn new(viewport: [f32; 2]) -> Self {
-        let saved_path = user_plan_path();
-        let doc = fs::read_to_string(&saved_path)
-            .ok()
-            .and_then(|text| Document::from_json(&text).ok())
-            .unwrap_or_else(load_demo);
-        if saved_path.is_file() {
-            crate::recent::remember(&saved_path, &doc.meta.name);
-        }
-        Self::from_doc(doc, viewport, saved_path)
+        // Launch into a blank sheet: the last plan stays in Recent, but it is
+        // no longer reopened automatically. Nothing is written until the user
+        // names and saves it, so an untitled session can never overwrite the
+        // previous plan.
+        let mut state = Self::from_doc(Document::new(""), viewport, PathBuf::new());
+        state.dirty = false;
+        state.saved_revision = state.revision;
+        state.note = Some("新建空白方案 · 保存时命名".into());
+        state
     }
 
     pub fn from_doc(mut doc: Document, viewport: [f32; 2], saved_path: PathBuf) -> Self {
         crate::templates::ensure_materials(&mut doc);
+        if !doc.settings.keep_authored_rooms && !doc.rooms.is_empty() {
+            let detected_total: usize = (0..doc.level_count())
+                .map(|floor| {
+                    let segments: Vec<(Pt, Pt)> = doc
+                        .walls
+                        .iter()
+                        .filter(|w| w.floor as usize == floor)
+                        .map(|w| (w.start, w.end))
+                        .collect();
+                    detect_rooms(&segments, ROOM_JOIN_TOLERANCE_MM, 0.3).len()
+                })
+                .sum();
+            if detected_total < doc.rooms.len() {
+                doc.settings.keep_authored_rooms = true;
+            }
+        }
+        if doc
+            .walls
+            .iter()
+            .any(|w| (w.floor as usize) < doc.level_count())
+        {
+            recompute_rooms(&mut doc);
+        }
         let mut cam = Camera2D::new(viewport);
         let (min, max) = plan_bounds(&doc);
         cam.fit(min, max, 80.0);
@@ -610,7 +1040,10 @@ impl SceneState {
             placing: None,
             opening_drag: None,
             hover: None,
+            hover_opening: None,
             drag: None,
+            wall_drag_walls: None,
+            wall_drag_openings: None,
             pan: None,
             draft: None,
             wall_pressed: false,
@@ -662,6 +1095,61 @@ impl SceneState {
 
     pub fn floor_name(&self) -> String {
         self.doc.level_name(self.floor_index())
+    }
+
+    /// Cut wall quads at every door/window opening so the plan shows a real gap
+    /// with only the door or window symbol inside it, not a wall under the symbol.
+    pub(crate) fn split_walls_at_openings(walls: &[Wall], openings: &[Opening]) -> Vec<Wall> {
+        let mut out = Vec::with_capacity(walls.len());
+        for wall in walls {
+            let len =
+                ((wall.end.x - wall.start.x) as f64).hypot((wall.end.y - wall.start.y) as f64);
+            if len < 1.0 {
+                out.push(wall.clone());
+                continue;
+            }
+            let mut cuts: Vec<(f64, f64)> = openings
+                .iter()
+                .filter(|o| o.wall_id == wall.id)
+                .filter_map(|o| {
+                    let start = (o.offset_mm as f64).clamp(0.0, len);
+                    let end = ((o.offset_mm + o.width_mm) as f64).clamp(0.0, len);
+                    (end - start > 0.5).then_some((start, end))
+                })
+                .collect();
+            if cuts.is_empty() {
+                out.push(wall.clone());
+                continue;
+            }
+            cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut spans = Vec::new();
+            let mut cursor = 0.0;
+            for (start, end) in cuts {
+                if start > cursor + 0.5 {
+                    spans.push((cursor, start));
+                }
+                cursor = cursor.max(end);
+            }
+            if cursor < len - 0.5 {
+                spans.push((cursor, len));
+            }
+            for (start, end) in spans {
+                let mut segment = wall.clone();
+                let at = |offset: f64| {
+                    let t = offset / len;
+                    Pt::new(
+                        wall.start.x + ((wall.end.x - wall.start.x) as f64 * t).round() as i32,
+                        wall.start.y + ((wall.end.y - wall.start.y) as f64 * t).round() as i32,
+                    )
+                };
+                segment.start = at(start);
+                segment.end = at(end);
+                if segment.start != segment.end {
+                    out.push(segment);
+                }
+            }
+        }
+        out
     }
 
     pub fn walls_for_floor(&self, floor: u32) -> Vec<Wall> {
@@ -886,6 +1374,7 @@ impl SceneState {
         self.selected_furniture = None;
         self.furniture_selection.clear();
         self.hover = None;
+        self.hover_opening = None;
         self.drag = None;
         self.draft = None;
         self.placing = None;
@@ -986,18 +1475,35 @@ impl SceneState {
         let floor_openings = self.openings_for_floor(floor);
         let fills = build_room_fills(&floor_rooms, &self.doc.materials, cam, selected_room);
         batch.vertices.extend(fills.vertices);
+        let render_walls = Self::split_walls_at_openings(&floor_walls, &floor_openings);
         let walls = if show_wall_finish {
             build_wall_finish_batch(
-                &floor_walls,
+                &render_walls,
                 &self.doc.materials,
                 cam,
                 self.doc.settings.show_bearing,
             )
         } else {
-            build_wall_batch_visible(&floor_walls, selection, cam, self.doc.settings.show_bearing)
+            build_wall_batch_visible(
+                &render_walls,
+                selection,
+                cam,
+                self.doc.settings.show_bearing,
+            )
         };
         batch.vertices.extend(walls.vertices);
-        let openings = build_opening_batch(&floor_walls, &floor_openings, cam, &[]);
+        let mut opening_marks = Vec::new();
+        if floor == self.floor() {
+            if let Some(id) = self.selected_opening {
+                opening_marks.push(id);
+            }
+            if let Some(id) = self.hover_opening
+                && !opening_marks.contains(&id)
+            {
+                opening_marks.push(id);
+            }
+        }
+        let openings = build_opening_batch(&floor_walls, &floor_openings, cam, &opening_marks);
         batch.vertices.extend(openings.vertices);
         if show_furniture && self.doc.settings.show_furniture {
             let floor_furniture = self.furniture_for_floor(floor);
@@ -1116,12 +1622,26 @@ impl SceneState {
             &self.furniture_selection,
             self.selected_room,
         );
+        if self.doc.settings.show_dimensions && self.doc.settings.show_dimension_chains {
+            let floor_walls: Vec<Wall> = self
+                .doc
+                .walls
+                .iter()
+                .filter(|w| w.floor == self.floor())
+                .cloned()
+                .collect();
+            let chains = dimension_chains(&floor_walls, &self.cam);
+            draw_dimension_chains(&mut batch, &chains);
+        }
 
         // Furniture follows the cursor before the click, so placement is
-        // WYSIWYG instead of "drop first, drag later". Never draw that ghost
+        // WYSIWYG instead of "drop first, drag later". The ghost only exists
+        // after the user arms a specific catalogue entry: opening the library
+        // alone must not spawn the first row's sofa. It is also suppressed
         // while the pointer sits on the rails / library, where it would look
         // like a stray default sofa appearing under the button.
         if self.tool == Tool::Furniture
+            && self.furniture_armed
             && self.placing.is_none()
             && !self.pointer_over_ui
             && self.pointer_in_canvas()
@@ -1406,8 +1926,50 @@ impl SceneState {
     /// Keep the orthogonal constraint, then let a nearby joint win over the
     /// projected grid point. Accepting the joint is what makes corners exact.
     fn snap_wall_end(&self, start: Pt, raw: Pt) -> Pt {
-        self.wall_snap_candidate(raw)
-            .unwrap_or_else(|| constrained_end(start, raw, true, DEFAULT_GRID_MM))
+        let snapped = self
+            .wall_snap_candidate(raw)
+            .unwrap_or_else(|| constrained_end(start, raw, true, DEFAULT_GRID_MM));
+        self.align_wall_to_existing(start, snapped)
+    }
+
+    /// If the stroke starts on an existing wall centreline and the tip is
+    /// already nearly parallel to that wall, put the tip exactly on the same
+    /// axis. This keeps extension walls collinear even when the pointer is a
+    /// few centimetres off.
+    fn align_wall_to_existing(&self, start: Pt, end: Pt) -> Pt {
+        let dx = (end.x - start.x) as f64;
+        let dy = (end.y - start.y) as f64;
+        let len = dx.hypot(dy);
+        if len < 60.0 {
+            return end;
+        }
+        let ux = dx / len;
+        let uy = dy / len;
+        for wall in self.doc.walls.iter().filter(|w| w.floor == self.floor()) {
+            if distance_point_segment(start, wall.start, wall.end) > 40.0 {
+                continue;
+            }
+            let wx = (wall.end.x - wall.start.x) as f64;
+            let wy = (wall.end.y - wall.start.y) as f64;
+            let wlen = wx.hypot(wy);
+            if wlen < 1.0 {
+                continue;
+            }
+            let vx = wx / wlen;
+            let vy = wy / wlen;
+            if (ux * vy - uy * vx).abs() > 0.10 {
+                continue;
+            }
+            let along = dx * vx + dy * vy;
+            let target = Pt::new(
+                (start.x as f64 + vx * along).round() as i32,
+                (start.y as f64 + vy * along).round() as i32,
+            );
+            if (target.x - end.x).abs() <= 80 && (target.y - end.y).abs() <= 80 {
+                return target;
+            }
+        }
+        end
     }
 
     /// Commit one wall segment. Both click-click and press-drag use this path.
@@ -1424,16 +1986,60 @@ impl SceneState {
             WallKind::Partition,
         );
         wall.floor = self.floor();
+
+        let before: Vec<Wall> = self
+            .doc
+            .walls
+            .iter()
+            .filter(|w| w.floor == self.floor())
+            .cloned()
+            .collect();
+        let mut next_id = self.doc.next_id();
+        let after = normalize_wall_addition(&before, wall, &self.doc.openings, &mut next_id);
+        let added: Vec<EntityId> = after
+            .iter()
+            .filter(|w| !before.iter().any(|b| b.id == w.id))
+            .map(|w| w.id)
+            .collect();
+        if after == before {
+            self.note = Some("与已有墙重合，未重复添加".into());
+            return;
+        }
+        let merged = after.len() < before.len() + added.len();
         self.history.execute(
-            Box::new(AddWall {
-                wall,
+            Box::new(ReplaceWalls {
+                floor: self.floor(),
+                before,
+                after,
                 before_rooms: None,
             }),
             &mut self.doc,
         );
-        self.selection = vec![id];
-        let len = ((end.x - start.x) as f64).hypot((end.y - start.y) as f64);
-        self.note = Some(format!("墙 {:.2} m", len / 1000.0));
+        if let Some(id) = added.first() {
+            self.selection = vec![*id];
+        } else {
+            let mid = Pt::new((start.x + end.x) / 2, (start.y + end.y) / 2);
+            self.selection = self
+                .doc
+                .walls
+                .iter()
+                .filter(|w| w.floor == self.floor())
+                .find(|w| distance_point_segment(mid, w.start, w.end) <= 30.0)
+                .map(|w| vec![w.id])
+                .unwrap_or_default();
+        }
+        let added_len: f64 = added
+            .iter()
+            .filter_map(|id| self.doc.walls.iter().find(|w| w.id == *id))
+            .map(|w| ((w.end.x - w.start.x) as f64).hypot((w.end.y - w.start.y) as f64))
+            .sum();
+        self.note = Some(if merged {
+            format!("已合并相邻墙 · 新增 {:.2} m", added_len / 1000.0)
+        } else if added.is_empty() {
+            "已吸附到已有墙，未新增".into()
+        } else {
+            format!("墙 {:.2} m", added_len / 1000.0)
+        });
     }
 
     fn commit_stair(&mut self, start: Pt, end: Pt) {
@@ -1932,6 +2538,8 @@ impl SceneState {
                 self.selected_stair = None;
             }
             self.selected_opening = Some(oid);
+            self.hover = None;
+            self.hover_opening = Some(oid);
             let grabbed = self
                 .doc
                 .openings
@@ -1945,7 +2553,7 @@ impl SceneState {
                         .map(|wall| (opening, wall))
                 });
             if let Some((opening, wall)) = grabbed {
-                let (_, ux, uy) = wall_axis(wall);
+                let (_, ux, uy) = wall_axis_signed(wall);
                 let world = self.cam.screen_to_world(pos);
                 let along =
                     (world.x - wall.start.x) as f64 * ux + (world.y - wall.start.y) as f64 * uy;
@@ -1965,6 +2573,7 @@ impl SceneState {
         let hit = hit_wall(&floor_walls, &self.cam, pos, 6.0);
         match hit {
             Some(id) => {
+                self.hover_opening = None;
                 if shift {
                     if let Some(i) = self.selection.iter().position(|s| *s == id) {
                         self.selection.remove(i);
@@ -1983,8 +2592,14 @@ impl SceneState {
                 }
                 self.drag =
                     DragSession::begin(&self.walls_for_floor(self.floor()), &self.selection, pos);
+                if self.drag.is_some() {
+                    self.wall_drag_walls = Some(self.doc.walls.clone());
+                    self.wall_drag_openings = Some(self.doc.openings.clone());
+                }
             }
             None => {
+                self.hover = None;
+                self.hover_opening = None;
                 let world = self.pointer_world();
                 let furn = self
                     .doc
@@ -2072,6 +2687,14 @@ impl SceneState {
                         self.selected_furniture = None;
                         self.furniture_selection.clear();
                     }
+                    self.box_select = None;
+                    self.drag = None;
+                } else if !shift && let Some(polygon) = self.room_region_at(world) {
+                    let room_id = self.add_room_from_region(polygon);
+                    self.selected_room = Some(room_id);
+                    self.selected_stair = None;
+                    self.selected_furniture = None;
+                    self.furniture_selection.clear();
                     self.box_select = None;
                     self.drag = None;
                 } else {
@@ -2242,7 +2865,7 @@ impl SceneState {
             else {
                 return;
             };
-            let (len, ux, uy) = wall_axis(&wall);
+            let (len, ux, uy) = wall_axis_signed(&wall);
             let max = (len - opening.width_mm as f64).max(0.0);
             let world = self.pointer_world();
             let along = (world.x - wall.start.x) as f64 * ux + (world.y - wall.start.y) as f64 * uy;
@@ -2353,8 +2976,11 @@ impl SceneState {
             }
             return;
         }
-        if let Some(drag) = &self.drag {
-            if drag.apply(&mut self.doc.walls, &self.cam, pos) {
+        if self.drag.is_some() {
+            let drag = self.drag.take().expect("checked");
+            let changed = self.apply_wall_drag(&drag, pos);
+            self.drag = Some(drag);
+            if changed {
                 self.touch();
             }
             return;
@@ -2363,7 +2989,14 @@ impl SceneState {
             self.touch();
             return;
         }
-        let hover = if matches!(self.tool, Tool::Select | Tool::Demolish) {
+        let hover_opening = if self.tool == Tool::Select {
+            self.hit_opening()
+        } else {
+            None
+        };
+        let hover = if self.tool == Tool::Select && hover_opening.is_some() {
+            None
+        } else if matches!(self.tool, Tool::Select | Tool::Demolish) {
             {
                 let floor_walls = self.walls_for_floor(self.floor());
                 hit_wall(&floor_walls, &self.cam, pos, 6.0)
@@ -2371,8 +3004,9 @@ impl SceneState {
         } else {
             None
         };
-        if hover != self.hover || self.draft.is_some() {
+        if hover != self.hover || hover_opening != self.hover_opening || self.draft.is_some() {
             self.hover = hover;
+            self.hover_opening = hover_opening;
             self.touch();
         }
     }
@@ -2592,41 +3226,104 @@ impl SceneState {
                 anchor[1].max(pos[1]),
             ];
             if (rect[2] - rect[0]) > 3.0 || (rect[3] - rect[1]) > 3.0 {
-                let picked = walls_in_rect(&self.walls_for_floor(self.floor()), &self.cam, rect);
+                let picked_walls =
+                    walls_in_rect(&self.walls_for_floor(self.floor()), &self.cam, rect);
+                let picked_furniture = self.furniture_in_rect(rect);
                 if shift {
-                    for id in picked {
+                    for id in picked_walls {
                         if !self.selection.contains(&id) {
                             self.selection.push(id);
                         }
                     }
+                    for id in picked_furniture {
+                        if !self.furniture_selection.contains(&id) {
+                            self.furniture_selection.push(id);
+                        }
+                    }
+                    self.selected_furniture = self.furniture_selection.first().copied();
                 } else {
-                    self.selection = picked;
+                    self.selection = picked_walls;
+                    self.furniture_selection = picked_furniture;
+                    self.selected_furniture = self.furniture_selection.first().copied();
                 }
             }
         }
         self.touch();
     }
 
-    fn commit_drag(&mut self, drag: &DragSession) {
+    /// Translate the selected walls, keeping every adjoining wall attached:
+    /// corner endpoints follow the moved wall, T-junctions stay on the host
+    /// line, and openings on stretched neighbours keep their absolute position.
+    fn apply_wall_drag(&mut self, drag: &DragSession, pos: [f32; 2]) -> bool {
+        let Some(snapshot) = self.wall_drag_walls.clone() else {
+            return false;
+        };
+        let Some(opening_snapshot) = self.wall_drag_openings.clone() else {
+            return false;
+        };
+        let ids = drag.ids();
+        let floor = self.floor();
+        let delta = drag.delta_mm(&self.cam, pos);
+        let mut walls = snapshot.clone();
+        for wall in walls
+            .iter_mut()
+            .filter(|w| w.floor == floor && ids.contains(&w.id))
+        {
+            wall.start = Pt::new(wall.start.x + delta[0], wall.start.y + delta[1]);
+            wall.end = Pt::new(wall.end.x + delta[0], wall.end.y + delta[1]);
+        }
+        let changed = walls != snapshot;
+        if changed {
+            self.doc.walls = walls;
+            // Openings keep their wall-local offsets, so they travel with the
+            // selected wall. Neighbouring walls and their openings stay put.
+            self.doc.openings = opening_snapshot;
+        }
+        changed
+    }
+
+    fn commit_drag(&mut self, _drag: &DragSession) {
+        let Some(wall_before) = self.wall_drag_walls.take() else {
+            return;
+        };
+        let Some(opening_before) = self.wall_drag_openings.take() else {
+            return;
+        };
         let mut moves = Vec::new();
-        for (id, before_start, before_end) in drag.origins() {
-            let Some(w) = self.doc.walls.iter().find(|w| w.id == *id) else {
+        for w in &self.doc.walls {
+            let Some(old) = wall_before.iter().find(|b| b.id == w.id) else {
                 continue;
             };
-            if w.start != *before_start || w.end != *before_end {
+            if w.start != old.start || w.end != old.end {
                 moves.push(WallMove {
-                    id: *id,
-                    before: [*before_start, *before_end],
+                    id: w.id,
+                    before: [old.start, old.end],
                     after: [w.start, w.end],
                 });
             }
         }
-        if !moves.is_empty() {
+        let opening_moves: Vec<OpeningMove> = self
+            .doc
+            .openings
+            .iter()
+            .filter_map(|o| {
+                opening_before
+                    .iter()
+                    .find(|b| b.id == o.id && b.offset_mm != o.offset_mm)
+                    .map(|b| OpeningMove {
+                        id: o.id,
+                        before: b.offset_mm,
+                        after: o.offset_mm,
+                    })
+            })
+            .collect();
+        if !moves.is_empty() || !opening_moves.is_empty() {
             // The document already holds the "after" state; applying again is
             // idempotent and keeps the history consistent.
             self.history.execute(
                 Box::new(MoveWalls {
                     moves,
+                    opening_moves,
                     before_rooms: None,
                 }),
                 &mut self.doc,
@@ -3160,6 +3857,10 @@ impl SceneState {
         self.doc.meta.address = address.trim().to_owned();
         self.doc.meta.note = note.trim().to_owned();
         self.touch();
+        if !self.has_path() {
+            self.note = Some("方案信息已更新 · 保存时写入文件".into());
+            return Ok(());
+        }
         let result = self.write_doc();
         if result.is_ok() {
             self.saved_revision = self.revision;
@@ -3657,10 +4358,10 @@ impl SceneState {
         self.touch();
     }
 
-    /// Arm a specific catalog entry. Clicking a category or a row is an
-    /// explicit "I want to place furniture", so it must also take the tool out
-    /// of wall/window mode and drop any plan selection; otherwise the old tool
-    /// stays highlighted while the first sofa row already looks selected.
+    /// Arm a specific catalog entry. Clicking a row is an explicit "I want to
+    /// place furniture", so it must also take the tool out of wall/window mode
+    /// and drop any plan selection; otherwise the old tool stays highlighted
+    /// while the first sofa row already looks selected.
     pub fn choose_catalog_item(&mut self, index: usize) {
         let index = index % CATALOG.len();
         self.catalog_index = index;
@@ -3676,12 +4377,14 @@ impl SceneState {
         self.touch();
     }
 
-    /// Switch the furniture library category and arm its first item.
+    /// Switch the furniture library category. Category tabs only filter the
+    /// list; they never arm a piece, so the cursor ghost appears only after
+    /// the user picks a concrete row.
     pub fn set_catalog_filter(&mut self, category: FurnitureCategory) {
         self.catalog_filter = category;
+        self.furniture_armed = false;
         if category == FurnitureCategory::All {
-            let current = self.catalog_index;
-            self.choose_catalog_item(current);
+            self.touch();
             return;
         }
         if let Some((index, _)) = CATALOG
@@ -3689,8 +4392,9 @@ impl SceneState {
             .enumerate()
             .find(|(_, spec)| spec.category == category)
         {
-            self.choose_catalog_item(index);
+            self.catalog_index = index;
         }
+        self.touch();
     }
 
     /// Plan centre (metres) and half-diagonal radius, used to frame the whole flat.
@@ -3719,6 +4423,32 @@ impl SceneState {
     pub fn scale_denominator(&self) -> f64 {
         const CSS_MM_PER_PX: f64 = 25.4 / 96.0;
         1.0 / (self.cam.scale * CSS_MM_PER_PX).max(f64::MIN_POSITIVE)
+    }
+
+    /// Storey wall totals in metres: (all, bearing, horizontal, vertical).
+    pub fn wall_stats(&self) -> (f64, f64, f64, f64) {
+        let floor = self.floor();
+        let mut all = 0.0;
+        let mut bearing = 0.0;
+        let mut horizontal = 0.0;
+        let mut vertical = 0.0;
+        for wall in self.doc.walls.iter().filter(|w| w.floor == floor) {
+            let dx = (wall.end.x - wall.start.x).abs();
+            let dy = (wall.end.y - wall.start.y).abs();
+            let len = ((wall.end.x - wall.start.x) as f64)
+                .hypot((wall.end.y - wall.start.y) as f64)
+                / 1000.0;
+            all += len;
+            if wall.kind == WallKind::Bearing {
+                bearing += len;
+            }
+            if dx >= dy {
+                horizontal += len;
+            } else {
+                vertical += len;
+            }
+        }
+        (all, bearing, horizontal, vertical)
     }
 
     /// Set the 2D view to a true 1:60 / 1:100 architectural scale. Unlike a
@@ -3761,6 +4491,29 @@ impl SceneState {
         }
         self.selected_furniture
             .and_then(|id| self.doc.furniture.iter().find(|f| f.id == id))
+    }
+
+    /// Furniture whose screen-space bounds overlap a marquee rectangle.
+    /// Rotated footprints use their axis-aligned bounds, which is slightly
+    /// generous at 45°, but matches the wall marquee's "intersects" rule.
+    fn furniture_in_rect(&self, rect: [f32; 4]) -> Vec<EntityId> {
+        let [min_x, min_y, max_x, max_y] = rect;
+        self.doc
+            .furniture
+            .iter()
+            .filter(|f| f.floor == self.floor())
+            .filter(|f| {
+                let (min, max) = furniture_bounds(f);
+                let a = self.cam.world_to_screen(min);
+                let b = self.cam.world_to_screen(max);
+                let left = a[0].min(b[0]);
+                let right = a[0].max(b[0]);
+                let top = a[1].min(b[1]);
+                let bottom = a[1].max(b[1]);
+                left <= max_x && right >= min_x && top <= max_y && bottom >= min_y
+            })
+            .map(|f| f.id)
+            .collect()
     }
 
     /// Screen position of the rotation handle above a selected piece of furniture.
@@ -4036,6 +4789,7 @@ impl SceneState {
             Layer::Furniture => settings.show_furniture,
             Layer::Grid => settings.show_grid,
             Layer::Dimensions => settings.show_dimensions,
+            Layer::DimensionChains => settings.show_dimension_chains,
             Layer::Bearing => settings.show_bearing,
             Layer::Underlay => settings.show_underlay,
         }
@@ -4049,6 +4803,9 @@ impl SceneState {
                 Layer::Furniture => settings.show_furniture = !settings.show_furniture,
                 Layer::Grid => settings.show_grid = !settings.show_grid,
                 Layer::Dimensions => settings.show_dimensions = !settings.show_dimensions,
+                Layer::DimensionChains => {
+                    settings.show_dimension_chains = !settings.show_dimension_chains;
+                }
                 Layer::Bearing => settings.show_bearing = !settings.show_bearing,
                 Layer::Underlay => settings.show_underlay = !settings.show_underlay,
             }
@@ -4288,7 +5045,6 @@ impl SceneState {
         const CUT_MM: i32 = 1350;
         let levels = self.doc.level_count();
         let mut scene = fp_render3d::MeshParts::new();
-        scene.push_opaque(fp_render3d::ground_mesh());
         for level in 0..levels {
             let floor = level as u32;
             let elevation = self.doc.level_elevation_mm(level) as f32 / 1000.0;
@@ -4339,22 +5095,35 @@ impl SceneState {
                 }
                 floor_parts.push_opaque(part);
             }
-            if !cutaway {
-                for opening in &openings {
-                    if opening.kind != OpeningKind::Door {
-                        continue;
+            let floor_rooms: Vec<Room> = self
+                .doc
+                .rooms
+                .iter()
+                .filter(|r| r.floor == floor)
+                .cloned()
+                .collect();
+            for opening in &openings {
+                let Some(wall) = walls.iter().find(|w| w.id == opening.wall_id) else {
+                    continue;
+                };
+                match opening.kind {
+                    OpeningKind::Door => {
+                        let swing = if self.doors_open.contains(&opening.id.0) {
+                            if opening.swing_deg < 0.0 { -78.0 } else { 78.0 }
+                        } else {
+                            0.0
+                        };
+                        floor_parts.push_opaque(fp_render3d::door_leaf_mesh(wall, opening, swing));
                     }
-                    let Some(wall) = walls.iter().find(|w| w.id == opening.wall_id) else {
-                        continue;
-                    };
-                    let swing = if self.doors_open.contains(&opening.id.0) {
-                        if opening.swing_deg < 0.0 { -78.0 } else { 78.0 }
-                    } else {
-                        0.0
-                    };
-                    floor_parts.push_opaque(fp_render3d::door_leaf_mesh(wall, opening, swing));
+                    OpeningKind::Bay => floor_parts.push_mixed(fp_render3d::bay_window_parts(
+                        wall,
+                        opening,
+                        &floor_rooms,
+                    )),
+                    _ => {}
                 }
             }
+            floor_parts.push_opaque(fp_render3d::opening_frame_mesh(&walls, &openings));
             if self.doc.settings.show_furniture {
                 for item in self.doc.furniture.iter().filter(|f| f.floor == floor) {
                     let mut parts = fp_render3d::furniture_mesh_parts(std::slice::from_ref(item));
@@ -4364,9 +5133,7 @@ impl SceneState {
                     floor_parts.push_mixed(parts);
                 }
             }
-            if !cutaway {
-                floor_parts.push_glass(fp_render3d::opening_glass_mesh(&walls, &openings));
-            }
+            floor_parts.push_glass(fp_render3d::opening_glass_mesh(&walls, &openings));
             for stair in self.doc.stairs.iter().filter(|s| s.floor == floor) {
                 floor_parts.push_opaque(fp_render3d::stair_mesh(
                     stair,
@@ -4628,6 +5395,7 @@ impl SceneState {
         self.drag = None;
         self.pan = None;
         self.hover = None;
+        self.hover_opening = None;
         self.walk_keys = [false; 4];
         self.walk_stick = [false; 4];
         self.walk_fast = false;
@@ -4646,12 +5414,28 @@ impl SceneState {
     }
 
     pub fn save_as(&mut self, path: PathBuf) {
+        if self.doc.meta.name.trim().is_empty()
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            let stem = stem.trim();
+            if !stem.is_empty() {
+                self.doc.meta.name = stem.to_owned();
+            }
+        }
         self.saved_path = path;
         self.save();
     }
 
     pub fn save_now(&mut self) {
         self.save();
+    }
+
+    pub fn has_path(&self) -> bool {
+        !self.saved_path.as_os_str().is_empty()
+    }
+
+    pub fn is_untitled(&self) -> bool {
+        !self.has_path()
     }
 
     fn write_doc(&self) -> Result<(), String> {
@@ -4663,6 +5447,10 @@ impl SceneState {
     }
 
     fn save(&mut self) {
+        if !self.has_path() {
+            self.note = Some("方案未命名 · 请选择保存位置".into());
+            return;
+        }
         let result = self.write_doc();
         if result.is_ok() {
             self.saved_revision = self.revision;
@@ -4677,7 +5465,7 @@ impl SceneState {
 
     /// Silent background save; returns true when the document was written.
     pub fn autosave_if_dirty(&mut self) -> bool {
-        if self.revision == self.saved_revision {
+        if !self.has_path() || self.revision == self.saved_revision {
             return false;
         }
         if self.write_doc().is_err() {
@@ -5565,6 +6353,7 @@ impl SceneState {
         self.history.execute(
             Box::new(MoveWalls {
                 moves,
+                opening_moves: Vec::new(),
                 before_rooms: None,
             }),
             &mut self.doc,
@@ -5753,6 +6542,62 @@ impl SceneState {
             .map(|o| o.id)
     }
 
+    /// Find the closed wall face under the pointer. This is the click-to-room
+    /// path that mirrors the web demo: an empty enclosed region can become a
+    /// real room instead of only being selectable after a wall edit.
+    fn room_region_at(&self, world: Pt) -> Option<Vec<Pt>> {
+        let floor = self.floor();
+        let walls = self.walls_for_floor(floor);
+        if walls.is_empty() {
+            return None;
+        }
+        let segments: Vec<(Pt, Pt)> = walls.iter().map(|w| (w.start, w.end)).collect();
+        detect_rooms(&segments, ROOM_JOIN_TOLERANCE_MM, 0.3)
+            .into_iter()
+            .find(|polygon| polygon.len() >= 3 && point_in_polygon(world, polygon))
+    }
+
+    fn region_is_bay_window(&self, polygon: &[Pt]) -> bool {
+        polygon_is_bay_window(&self.doc, polygon)
+    }
+
+    fn add_room_from_region(&mut self, polygon: Vec<Pt>) -> EntityId {
+        let floor = self.floor();
+        let corridor = room_is_corridor(&polygon);
+        let bay = self.region_is_bay_window(&polygon);
+        let material_id = self
+            .doc
+            .materials
+            .iter()
+            .find(|m| m.surface == FinishSurface::Floor)
+            .map(|m| m.id);
+        let ceiling_material_id =
+            crate::templates::built_in_finish_id(&self.doc, FinishSurface::Ceiling, "paint");
+        let name = if corridor {
+            "过道".to_string()
+        } else if bay {
+            "飘窗".to_string()
+        } else {
+            format!(
+                "房间 {}",
+                self.doc.rooms.iter().filter(|r| r.floor == floor).count() + 1
+            )
+        };
+        let room = Room {
+            id: EntityId(self.doc.next_id()),
+            polygon,
+            name,
+            material_id,
+            counted: !bay,
+            floor,
+            ceiling_material_id,
+        };
+        let id = room.id;
+        self.history
+            .execute(Box::new(AddRoom { room }), &mut self.doc);
+        id
+    }
+
     /// Text drawn on top of the plan: wall lengths and room names.
     pub fn labels(&self) -> Vec<PlanLabel> {
         let mut out = Vec::new();
@@ -5777,6 +6622,52 @@ impl SceneState {
                     text: format!("{len_mm:.0}"),
                     pos: [mid[0] + normal[0] * 13.0, mid[1] + normal[1] * 13.0],
                     bold: false,
+                    sub: None,
+                });
+            }
+        }
+        if self.doc.settings.show_dimensions && self.doc.settings.show_dimension_chains {
+            let floor_walls: Vec<Wall> = self
+                .doc
+                .walls
+                .iter()
+                .filter(|w| w.floor == floor)
+                .cloned()
+                .collect();
+            for chain in dimension_chains(&floor_walls, &self.cam) {
+                for (start, end, len_mm) in &chain.segments {
+                    if chain.horizontal {
+                        out.push(PlanLabel {
+                            text: format!("{len_mm:.0}"),
+                            pos: [(*start + *end) * 0.5, chain.line - 8.0],
+                            bold: false,
+                            sub: None,
+                        });
+                    } else {
+                        out.push(PlanLabel {
+                            text: format!("{len_mm:.0}"),
+                            pos: [chain.line + 9.0, (*start + *end) * 0.5],
+                            bold: false,
+                            sub: None,
+                        });
+                    }
+                }
+                let total = format!(
+                    "{} {:.2} m",
+                    if chain.horizontal { "X" } else { "Y" },
+                    chain.total_mm / 1000.0
+                );
+                let pos = match chain.side {
+                    DimSide::Top => [chain.mid(), chain.total_line - 8.0],
+                    DimSide::Bottom => [chain.mid(), chain.total_line + 8.0],
+                    DimSide::Left => [chain.total_line - 10.0, chain.mid()],
+                    DimSide::Right => [chain.total_line + 10.0, chain.mid()],
+                };
+                out.push(PlanLabel {
+                    text: total,
+                    pos,
+                    bold: true,
+                    sub: None,
                 });
             }
         }
@@ -5794,6 +6685,7 @@ impl SceneState {
                 text: format!("{:.2} m", measurement.length_mm() / 1000.0),
                 pos: [mid[0] + normal[0] * 14.0, mid[1] + normal[1] * 14.0],
                 bold: true,
+                sub: None,
             });
         }
         if self.tool == Tool::Measure
@@ -5816,6 +6708,7 @@ impl SceneState {
                     ),
                     pos: [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 - 14.0],
                     bold: true,
+                    sub: None,
                 });
             }
         }
@@ -5824,7 +6717,7 @@ impl SceneState {
                 break;
             }
             let area = fp_geom::area(&room.polygon) / 1.0e6;
-            if area < 1.5 {
+            if area < 0.3 {
                 continue;
             }
             let n = room.polygon.len().max(1) as f64;
@@ -5834,7 +6727,8 @@ impl SceneState {
                 .cam
                 .world_to_screen(Pt::new(cx.round() as i32, cy.round() as i32));
             out.push(PlanLabel {
-                text: format!("{} {:.1}m²", room.name, area),
+                text: room.name.clone(),
+                sub: Some(format!("{area:.1} m²")),
                 pos,
                 bold: true,
             });
@@ -5949,7 +6843,94 @@ impl SceneState {
 
 /// Recover rooms from wall centrelines, keeping names/materials of rooms whose
 /// old polygon still contains the new room's centroid.
+/// Approximate the clear width of a room: twice the largest distance from an
+/// interior sample point to the outline. Unlike a bounding box this still
+/// measures an L-shaped hallway correctly around its corner.
+fn room_clear_width(polygon: &[Pt]) -> f64 {
+    let (min, max) = polygon.iter().fold(
+        (Pt::new(i32::MAX, i32::MAX), Pt::new(i32::MIN, i32::MIN)),
+        |(mut min, mut max), p| {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+            (min, max)
+        },
+    );
+    let span_x = (max.x - min.x) as f64;
+    let span_y = (max.y - min.y) as f64;
+    if span_x < 1.0 || span_y < 1.0 {
+        return 0.0;
+    }
+    let step = (span_x.max(span_y) / 22.0).clamp(80.0, 180.0);
+    let mut best = 0.0_f64;
+    let mut y = min.y as f64 + step * 0.5;
+    while y < max.y as f64 {
+        let mut x = min.x as f64 + step * 0.5;
+        while x < max.x as f64 {
+            let p = Pt::new(x.round() as i32, y.round() as i32);
+            if point_in_polygon(p, polygon) {
+                best = best.max(polygon_margin(p, polygon));
+            }
+            x += step;
+        }
+        y += step;
+    }
+    best * 2.0
+}
+
+fn room_is_corridor(polygon: &[Pt]) -> bool {
+    let area = fp_geom::area(polygon);
+    let width = room_clear_width(polygon);
+    width > 200.0 && width <= 1600.0 && area >= 2.0e6 && area / (width * width) >= 2.2
+}
+
+fn polygon_is_bay_window(doc: &Document, polygon: &[Pt]) -> bool {
+    let area = fp_geom::area(polygon).abs();
+    if area > 12.0e6 {
+        return false;
+    }
+    doc.openings
+        .iter()
+        .filter(|o| o.kind == OpeningKind::Bay)
+        .any(|o| {
+            let Some(wall) = doc.walls.iter().find(|w| w.id == o.wall_id) else {
+                return false;
+            };
+            let len =
+                ((wall.end.x - wall.start.x) as f64).hypot((wall.end.y - wall.start.y) as f64);
+            if len < 1.0 {
+                return false;
+            }
+            let t = ((o.offset_mm + o.width_mm / 2) as f64 / len).clamp(0.0, 1.0);
+            let p = Pt::new(
+                wall.start.x + ((wall.end.x - wall.start.x) as f64 * t).round() as i32,
+                wall.start.y + ((wall.end.y - wall.start.y) as f64 * t).round() as i32,
+            );
+            point_in_polygon(p, polygon)
+        })
+}
+
+fn next_room_id(used: &HashSet<EntityId>, fallback: &mut u128) -> EntityId {
+    while used.contains(&EntityId(*fallback)) {
+        *fallback += 1;
+    }
+    let id = EntityId(*fallback);
+    *fallback += 1;
+    id
+}
+
 fn recompute_rooms(doc: &mut Document) {
+    recompute_rooms_with(doc, false);
+}
+
+/// Wall drags must never erase a room label just because the detector briefly
+/// sees fewer faces while the corners are still following the pointer.
+fn recompute_rooms_after_drag(doc: &mut Document) {
+    recompute_rooms_with(doc, true);
+}
+
+fn recompute_rooms_with(doc: &mut Document, keep_missing: bool) {
     let levels = doc.level_count();
     let old = doc.rooms.clone();
     let default_material = doc
@@ -5957,10 +6938,15 @@ fn recompute_rooms(doc: &mut Document) {
         .iter()
         .find(|m| m.surface == FinishSurface::Floor)
         .map(|m| m.id);
+    let corridor_material = doc
+        .materials
+        .iter()
+        .find(|m| m.surface == FinishSurface::Floor && m.kind == "tile")
+        .map(|m| m.id);
     let default_ceiling =
         crate::templates::built_in_finish_id(doc, FinishSurface::Ceiling, "paint");
     let mut fallback = doc.next_id();
-    let mut rooms: Vec<Room> = Vec::new();
+    let mut polygons_by_floor = Vec::with_capacity(levels);
     for floor in 0..levels {
         let segments: Vec<(Pt, Pt)> = doc
             .walls
@@ -5968,39 +6954,86 @@ fn recompute_rooms(doc: &mut Document) {
             .filter(|w| w.floor as usize == floor)
             .map(|w| (w.start, w.end))
             .collect();
-        let polygons = detect_rooms(&segments, ROOM_JOIN_TOLERANCE_MM, 0.3);
+        polygons_by_floor.push(detect_rooms(&segments, ROOM_JOIN_TOLERANCE_MM, 0.3));
+    }
+    // Imported plans can carry valid room polygons while their wall strokes
+    // are broken into short, non-joining segments. Keep those authored rooms
+    // and only update the ones the detector can actually rebuild, otherwise a
+    // single wall edit can erase every other room label.
+    let preserve = (doc.settings.keep_authored_rooms || keep_missing)
+        && !old.is_empty()
+        && doc.walls.iter().any(|w| (w.floor as usize) < levels);
+    let mut rooms: Vec<Room> = Vec::new();
+    let mut used_ids: HashSet<EntityId> = HashSet::new();
+    for (floor, polygons) in polygons_by_floor.into_iter().enumerate() {
         let old_floor: Vec<&Room> = old.iter().filter(|r| r.floor as usize == floor).collect();
+        // A stale plan can contain two rooms sharing one id. Match each old
+        // room at most once, and never emit two detected rooms with one id.
+        let mut used_old: HashSet<usize> = HashSet::new();
         for polygon in polygons {
+            let corridor = room_is_corridor(&polygon);
             let n = polygon.len().max(1) as f64;
             let cx = polygon.iter().map(|p| p.x as f64).sum::<f64>() / n;
             let cy = polygon.iter().map(|p| p.y as f64).sum::<f64>() / n;
             let centroid = Pt::new(cx.round() as i32, cy.round() as i32);
             let hit = old_floor
                 .iter()
-                .find(|r| r.polygon.len() >= 3 && point_in_polygon(centroid, &r.polygon));
-            let (id, name, material_id, counted, ceiling_material_id) = match hit {
-                Some(r) => (
-                    r.id,
-                    r.name.clone(),
-                    r.material_id,
-                    r.counted,
-                    r.ceiling_material_id,
-                ),
-                None => {
-                    let id = EntityId(fallback);
-                    fallback += 1;
+                .enumerate()
+                .find(|(index, r)| {
+                    !used_old.contains(index)
+                        && r.polygon.len() >= 3
+                        && point_in_polygon(centroid, &r.polygon)
+                })
+                .map(|(index, room)| {
+                    used_old.insert(index);
+                    room
+                });
+            let (mut id, name, material_id, counted, ceiling_material_id) = match hit {
+                Some(r) => {
+                    let auto_named =
+                        r.name.trim().is_empty() || r.name.trim_start().starts_with("房间 ");
+                    let name = if corridor && auto_named {
+                        "过道".to_string()
+                    } else {
+                        r.name.clone()
+                    };
                     (
-                        id,
-                        format!(
-                            "房间 {}",
-                            rooms.iter().filter(|r| r.floor as usize == floor).count() + 1
-                        ),
-                        default_material,
-                        true,
+                        r.id,
+                        name,
+                        r.material_id
+                            .or(if corridor { corridor_material } else { None }),
+                        r.counted,
+                        r.ceiling_material_id,
+                    )
+                }
+                None => {
+                    let bay = polygon_is_bay_window(doc, &polygon);
+                    (
+                        next_room_id(&used_ids, &mut fallback),
+                        if corridor {
+                            "过道".to_string()
+                        } else if bay {
+                            "飘窗".to_string()
+                        } else {
+                            format!(
+                                "房间 {}",
+                                rooms.iter().filter(|r| r.floor as usize == floor).count() + 1
+                            )
+                        },
+                        if corridor {
+                            corridor_material.or(default_material)
+                        } else {
+                            default_material
+                        },
+                        !bay,
                         default_ceiling,
                     )
                 }
             };
+            if used_ids.contains(&id) {
+                id = next_room_id(&used_ids, &mut fallback);
+            }
+            used_ids.insert(id);
             rooms.push(Room {
                 id,
                 polygon,
@@ -6012,9 +7045,39 @@ fn recompute_rooms(doc: &mut Document) {
             });
         }
     }
-    doc.rooms = rooms;
+    if preserve {
+        let mut merged = old.clone();
+        for room in rooms {
+            if let Some(existing) = merged.iter_mut().find(|r| r.id == room.id) {
+                existing.polygon = room.polygon;
+            } else {
+                merged.push(room);
+            }
+        }
+        doc.rooms = merged;
+    } else {
+        doc.rooms = rooms;
+    }
 }
 // ------------------------------------------------------------------- commands
+
+struct AddRoom {
+    room: Room,
+}
+
+impl Command for AddRoom {
+    fn label(&self) -> &str {
+        "add-room"
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        if !doc.rooms.iter().any(|r| r.id == self.room.id) {
+            doc.rooms.push(self.room.clone());
+        }
+    }
+    fn undo(&mut self, doc: &mut Document) {
+        doc.rooms.retain(|r| r.id != self.room.id);
+    }
+}
 
 struct AddMeasure {
     measure: Measure,
@@ -6147,11 +7210,6 @@ impl Command for RemoveStair {
     }
 }
 
-struct AddWall {
-    wall: Wall,
-    before_rooms: Option<Vec<Room>>,
-}
-
 struct RenameRoom {
     id: EntityId,
     before: Option<String>,
@@ -6210,19 +7268,28 @@ impl Command for PasteBundle {
     }
 }
 
-impl Command for AddWall {
+struct ReplaceWalls {
+    floor: u32,
+    before: Vec<Wall>,
+    after: Vec<Wall>,
+    before_rooms: Option<Vec<Room>>,
+}
+
+impl Command for ReplaceWalls {
     fn label(&self) -> &str {
-        "add-wall"
+        "replace-walls"
     }
     fn apply(&mut self, doc: &mut Document) {
         if self.before_rooms.is_none() {
             self.before_rooms = Some(doc.rooms.clone());
         }
-        doc.walls.push(self.wall.clone());
+        doc.walls.retain(|w| w.floor != self.floor);
+        doc.walls.extend(self.after.iter().cloned());
         recompute_rooms(doc);
     }
     fn undo(&mut self, doc: &mut Document) {
-        doc.walls.retain(|w| w.id != self.wall.id);
+        doc.walls.retain(|w| w.floor != self.floor);
+        doc.walls.extend(self.before.iter().cloned());
         if let Some(rooms) = self.before_rooms.take() {
             doc.rooms = rooms;
         }
@@ -6235,8 +7302,16 @@ struct WallMove {
     after: [Pt; 2],
 }
 
+#[derive(Clone, Copy)]
+struct OpeningMove {
+    id: EntityId,
+    before: i32,
+    after: i32,
+}
+
 struct MoveWalls {
     moves: Vec<WallMove>,
+    opening_moves: Vec<OpeningMove>,
     before_rooms: Option<Vec<Room>>,
 }
 
@@ -6254,13 +7329,23 @@ impl Command for MoveWalls {
                 w.end = m.after[1];
             }
         }
-        recompute_rooms(doc);
+        for m in &self.opening_moves {
+            if let Some(o) = doc.openings.iter_mut().find(|o| o.id == m.id) {
+                o.offset_mm = m.after;
+            }
+        }
+        recompute_rooms_after_drag(doc);
     }
     fn undo(&mut self, doc: &mut Document) {
         for m in &self.moves {
             if let Some(w) = doc.walls.iter_mut().find(|w| w.id == m.id) {
                 w.start = m.before[0];
                 w.end = m.before[1];
+            }
+        }
+        for m in &self.opening_moves {
+            if let Some(o) = doc.openings.iter_mut().find(|o| o.id == m.id) {
+                o.offset_mm = m.before;
             }
         }
         if let Some(rooms) = self.before_rooms.take() {
@@ -6956,11 +8041,6 @@ fn walk_camera(doc: &Document) -> WalkCamera {
     )
 }
 
-fn load_demo() -> Document {
-    let json = include_str!("../../../assets/samples/demo-apartment.json");
-    Document::from_json(json).unwrap_or_else(|_| Document::new("未命名户型"))
-}
-
 pub fn plan_bounds(doc: &Document) -> (Pt, Pt) {
     let mut min = Pt::new(i32::MAX, i32::MAX);
     let mut max = Pt::new(i32::MIN, i32::MIN);
@@ -7110,6 +8190,34 @@ mod tests {
             [1000.0, 800.0],
             PathBuf::from("/tmp/fp-test-plan.json"),
         )
+    }
+
+    #[test]
+    fn launch_starts_with_an_untitled_clean_sheet() {
+        let state = SceneState::new([1000.0, 800.0]);
+        assert!(state.is_untitled(), "must not reopen the previous plan");
+        assert!(!state.is_dirty(), "a blank sheet has nothing to save yet");
+        assert!(state.doc.meta.name.is_empty());
+        assert!(state.doc.walls.is_empty());
+    }
+
+    #[test]
+    fn saving_an_untitled_sheet_takes_its_name_from_the_file() {
+        let path = PathBuf::from(format!(
+            "/tmp/fathom-untitled-{}-name.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut state = SceneState::new([1000.0, 800.0]);
+        state.touch();
+        state.save_as(path.clone());
+        assert_eq!(
+            state.doc.meta.name,
+            path.file_stem().unwrap().to_str().unwrap()
+        );
+        assert!(!state.is_dirty(), "save clears the dirty flag");
+        assert!(path.is_file());
+        let _ = std::fs::remove_file(&path);
     }
 
     fn draw_wall(s: &mut SceneState) {
@@ -7279,7 +8387,7 @@ mod tests {
     fn furniture_tool_shows_a_translucent_ghost_before_clicking() {
         let mut s = empty();
         let before = s.build_batch().vertices.len();
-        s.set_tool(Tool::Furniture);
+        s.choose_catalog_item(0);
         s.set_pointer_over_ui(false);
         s.pointer_move([450.0, 360.0]);
         let after = s.build_batch();
@@ -7287,6 +8395,36 @@ mod tests {
         assert!(
             after.vertices.iter().any(|v| v.color[3] < 0.9),
             "ghost should be translucent"
+        );
+    }
+
+    #[test]
+    fn opening_the_library_does_not_ghost_a_default_sofa() {
+        let mut s = empty();
+        let before = s.build_batch().vertices.len();
+        s.begin_furniture_browse();
+        s.set_pointer_over_ui(false);
+        s.pointer_move([450.0, 360.0]);
+        assert_eq!(
+            s.build_batch().vertices.len(),
+            before,
+            "browsing the library alone must not draw a furniture ghost"
+        );
+    }
+
+    #[test]
+    fn switching_category_only_filters_and_never_arms_a_piece() {
+        let mut s = empty();
+        let before = s.build_batch().vertices.len();
+        s.begin_furniture_browse();
+        s.set_catalog_filter(FurnitureCategory::Bedroom);
+        s.set_pointer_over_ui(false);
+        s.pointer_move([450.0, 360.0]);
+        assert!(!s.furniture_armed, "category tab must not arm a piece");
+        assert_eq!(
+            s.build_batch().vertices.len(),
+            before,
+            "category tab must not draw a ghost either"
         );
     }
 
@@ -7303,6 +8441,101 @@ mod tests {
         assert_eq!(s.doc.furniture.len(), 1);
         assert_eq!(s.tool, Tool::Select);
         assert!(s.placing.is_none());
+    }
+
+    #[test]
+    fn new_wall_is_clipped_to_the_uncovered_part_of_existing_walls() {
+        let existing = Wall::new(
+            EntityId(1),
+            Pt::new(0, 0),
+            Pt::new(4000, 0),
+            120,
+            WallKind::Partition,
+        );
+        let opening = Opening {
+            id: EntityId(9),
+            wall_id: EntityId(1),
+            kind: OpeningKind::Door,
+            offset_mm: 400,
+            width_mm: 800,
+            height_mm: 2100,
+            sill_mm: 0,
+            swing_deg: 90.0,
+            hinge_right: false,
+            price: None,
+        };
+        let candidate = Wall::new(
+            EntityId(2),
+            Pt::new(1000, 0),
+            Pt::new(6000, 0),
+            120,
+            WallKind::Partition,
+        );
+        let after = normalize_wall_addition(&[existing], candidate, &[opening], &mut 10);
+        assert_eq!(after.len(), 2, "opening host is kept and the tail is added");
+        let added = after.iter().find(|w| w.id == EntityId(10)).unwrap();
+        assert_eq!(added.start, Pt::new(4000, 0));
+        assert_eq!(added.end, Pt::new(6000, 0));
+    }
+
+    #[test]
+    fn touching_collinear_walls_merge_without_an_opening() {
+        let existing = Wall::new(
+            EntityId(1),
+            Pt::new(0, 0),
+            Pt::new(2000, 0),
+            120,
+            WallKind::Partition,
+        );
+        let candidate = Wall::new(
+            EntityId(2),
+            Pt::new(2000, 0),
+            Pt::new(4000, 0),
+            120,
+            WallKind::Partition,
+        );
+        let after = normalize_wall_addition(&[existing], candidate, &[], &mut 10);
+        assert_eq!(after.len(), 1, "one continuous wall");
+        assert_eq!(after[0].start, Pt::new(0, 0));
+        assert_eq!(after[0].end, Pt::new(4000, 0));
+    }
+
+    #[test]
+    fn corridor_detection_uses_clear_width_not_bounding_box() {
+        let straight = [
+            Pt::new(0, 0),
+            Pt::new(4000, 0),
+            Pt::new(4000, 1200),
+            Pt::new(0, 1200),
+        ];
+        assert!(room_is_corridor(&straight));
+        let l_shape = [
+            Pt::new(0, 0),
+            Pt::new(3000, 0),
+            Pt::new(3000, 1200),
+            Pt::new(1200, 1200),
+            Pt::new(1200, 4000),
+            Pt::new(0, 4000),
+        ];
+        assert!(room_is_corridor(&l_shape), "L-shaped hallway");
+        let bedroom = [
+            Pt::new(0, 0),
+            Pt::new(3000, 0),
+            Pt::new(3000, 3000),
+            Pt::new(0, 3000),
+        ];
+        assert!(!room_is_corridor(&bedroom));
+    }
+
+    #[test]
+    fn dimension_chains_cover_all_four_sides() {
+        let s = room_state();
+        let walls: Vec<Wall> = s.doc.walls.clone();
+        let chains = dimension_chains(&walls, &s.cam);
+        assert_eq!(chains.len(), 4);
+        assert_eq!(chains.iter().filter(|c| c.horizontal).count(), 2);
+        assert_eq!(chains.iter().filter(|c| !c.horizontal).count(), 2);
+        assert!(chains.iter().all(|c| c.total_mm > 3000.0));
     }
 
     #[test]
@@ -7378,6 +8611,232 @@ mod tests {
         assert_eq!(s.history.undo_len(), 2, "add wall + move");
         s.key("z", true, false);
         assert_eq!(s.doc.walls[0].start, before);
+    }
+
+    #[test]
+    fn authored_rooms_survive_a_wall_edit_when_the_graph_is_fragmented() {
+        let mut doc = Document::new("imported");
+        doc.walls.push(Wall::new(
+            EntityId(1),
+            Pt::new(0, 0),
+            Pt::new(4000, 0),
+            120,
+            WallKind::Partition,
+        ));
+        doc.rooms.push(Room {
+            id: EntityId(2),
+            polygon: vec![
+                Pt::new(0, 0),
+                Pt::new(4000, 0),
+                Pt::new(4000, 3000),
+                Pt::new(0, 3000),
+            ],
+            name: "客厅".into(),
+            material_id: None,
+            counted: true,
+            floor: 0,
+            ceiling_material_id: None,
+        });
+        let mut s = SceneState::from_doc(doc, [1000.0, 800.0], PathBuf::from("/tmp/imported.json"));
+        assert!(s.doc.settings.keep_authored_rooms);
+        s.doc.walls[0].start.x += 300;
+        s.doc.walls[0].end.x += 300;
+        recompute_rooms(&mut s.doc);
+        assert_eq!(s.doc.rooms.len(), 1, "authored room must not be erased");
+        assert_eq!(s.doc.rooms[0].name, "客厅");
+    }
+
+    fn three_room_doc() -> Document {
+        let mut doc = Document::new("three rooms");
+        let outer = [
+            (Pt::new(0, 0), Pt::new(10_000, 0)),
+            (Pt::new(10_000, 0), Pt::new(10_000, 8_000)),
+            (Pt::new(10_000, 8_000), Pt::new(0, 8_000)),
+            (Pt::new(0, 8_000), Pt::new(0, 0)),
+        ];
+        for (i, (start, end)) in outer.into_iter().enumerate() {
+            doc.walls.push(Wall::new(
+                EntityId(i as u128 + 1),
+                start,
+                end,
+                240,
+                WallKind::Bearing,
+            ));
+        }
+        doc.walls.push(Wall::new(
+            EntityId(5),
+            Pt::new(5_000, 0),
+            Pt::new(5_000, 8_000),
+            120,
+            WallKind::Partition,
+        ));
+        doc.walls.push(Wall::new(
+            EntityId(6),
+            Pt::new(5_000, 4_000),
+            Pt::new(10_000, 4_000),
+            120,
+            WallKind::Partition,
+        ));
+        doc
+    }
+
+    #[test]
+    fn stale_duplicate_room_ids_are_rebuilt_with_unique_ids() {
+        let mut doc = three_room_doc();
+        for (i, polygon) in [
+            vec![
+                Pt::new(0, 0),
+                Pt::new(5_000, 0),
+                Pt::new(5_000, 8_000),
+                Pt::new(0, 8_000),
+            ],
+            vec![
+                Pt::new(5_000, 4_000),
+                Pt::new(10_000, 4_000),
+                Pt::new(10_000, 8_000),
+                Pt::new(5_000, 8_000),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            doc.rooms.push(Room {
+                id: EntityId(101),
+                polygon,
+                name: "客厅".into(),
+                material_id: None,
+                counted: true,
+                floor: 0,
+                ceiling_material_id: None,
+            });
+            let _ = i;
+        }
+        let s = SceneState::from_doc(doc, [1000.0, 800.0], PathBuf::from("/tmp/stale.json"));
+        assert_eq!(s.doc.rooms.len(), 3);
+        let ids: HashSet<EntityId> = s.doc.rooms.iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 3, "room ids must be unique");
+    }
+
+    #[test]
+    fn a_drag_that_breaks_detection_keeps_the_old_room_labels() {
+        let doc = three_room_doc();
+        let mut s = SceneState::from_doc(doc, [1000.0, 800.0], PathBuf::from("/tmp/three.json"));
+        assert_eq!(s.doc.rooms.len(), 3);
+        // Tear the top-left corner apart, so the detector no longer sees three
+        // closed faces. The drag safety net must still keep all labels.
+        s.doc.walls[0].start.x -= 1_000;
+        recompute_rooms_after_drag(&mut s.doc);
+        assert_eq!(s.doc.rooms.len(), 3, "labels must survive a broken drag");
+    }
+
+    #[test]
+    fn dragging_a_partition_keeps_three_rooms_and_their_labels() {
+        let mut doc = Document::new("three rooms");
+        let outer = [
+            (Pt::new(0, 0), Pt::new(10_000, 40)),
+            (Pt::new(10_000, 40), Pt::new(10_000, 8_000)),
+            (Pt::new(10_000, 8_000), Pt::new(0, 8_000)),
+            (Pt::new(0, 8_000), Pt::new(0, 0)),
+        ];
+        for (i, (start, end)) in outer.into_iter().enumerate() {
+            doc.walls.push(Wall::new(
+                EntityId(i as u128 + 1),
+                start,
+                end,
+                240,
+                WallKind::Bearing,
+            ));
+        }
+        doc.walls.push(Wall::new(
+            EntityId(5),
+            Pt::new(5_000, 0),
+            Pt::new(5_000, 8_000),
+            120,
+            WallKind::Partition,
+        ));
+        doc.walls.push(Wall::new(
+            EntityId(6),
+            Pt::new(5_000, 4_000),
+            Pt::new(10_000, 4_000),
+            120,
+            WallKind::Partition,
+        ));
+        let mut s = SceneState::from_doc(doc, [1000.0, 800.0], PathBuf::from("/tmp/three.json"));
+        assert_eq!(s.doc.rooms.len(), 3, "three rooms detected");
+        s.set_tool(Tool::Select);
+        let before = s.doc.rooms.clone();
+        let from = s.cam.world_to_screen(Pt::new(5_000, 2_000));
+        let to = s.cam.world_to_screen(Pt::new(6_000, 2_000));
+        s.pointer_down(from, PointerButton::Left, false);
+        s.pointer_move(to);
+        s.pointer_up(to, PointerButton::Left, false);
+        assert!(!before.is_empty());
+        assert_eq!(
+            s.doc.rooms.len(),
+            before.len(),
+            "dragging a partition must keep all room labels"
+        );
+        for room in &before {
+            assert!(
+                s.doc
+                    .rooms
+                    .iter()
+                    .any(|r| r.id == room.id && r.name == room.name),
+                "room {} disappeared",
+                room.name
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_an_empty_enclosed_region_creates_a_room() {
+        let mut s = empty();
+        draw_rect(&mut s);
+        s.doc.rooms.clear();
+        s.set_tool(Tool::Select);
+        s.pointer_down([400.0, 250.0], PointerButton::Left, false);
+        assert_eq!(
+            s.doc.rooms.len(),
+            1,
+            "clicking a closed region should create a room"
+        );
+        let room = &s.doc.rooms[0];
+        assert!(room.name.starts_with("房间 "), "got {}", room.name);
+        assert!(s.selected_room.is_some());
+    }
+
+    #[test]
+    fn dragging_one_wall_moves_only_that_wall() {
+        let mut s = empty();
+        draw_rect(&mut s);
+        assert_eq!(s.doc.rooms.len(), 1, "rectangle should produce one room");
+        let before = s
+            .doc
+            .walls
+            .iter()
+            .map(|w| (w.id, w.start, w.end))
+            .collect::<Vec<_>>();
+        s.set_tool(Tool::Select);
+        s.pointer_down([400.0, 400.0], PointerButton::Left, false);
+        s.pointer_move([400.0, 360.0]);
+        s.pointer_up([400.0, 360.0], PointerButton::Left, false);
+        assert_eq!(
+            s.doc.rooms.len(),
+            1,
+            "the room label must survive even though the wall detached"
+        );
+        let changed = s
+            .doc
+            .walls
+            .iter()
+            .filter(|w| {
+                before
+                    .iter()
+                    .find(|(id, _, _)| *id == w.id)
+                    .is_some_and(|(_, start, end)| *start != w.start || *end != w.end)
+            })
+            .count();
+        assert_eq!(changed, 1, "only the selected wall should move");
     }
 
     fn project(cam: &OrbitCamera, size: [f32; 2], p: Vec3) -> [f32; 2] {
@@ -7957,14 +9416,22 @@ mod tests {
         s.set_tool(Tool::Furniture);
         s.pointer_down([320.0, 220.0], PointerButton::Left, false);
         let full = s.build_batch().vertices.len();
-        assert!(s.labels().iter().any(|l| l.text.contains("m²")));
+        assert!(
+            s.labels()
+                .iter()
+                .any(|l| l.sub.as_deref().is_some_and(|s| s.contains("m²")))
+        );
         s.toggle_layer(Layer::Furniture);
         s.toggle_layer(Layer::Grid);
         s.toggle_layer(Layer::RoomNames);
         let lean = s.build_batch().vertices.len();
         assert!(lean < full, "{lean} !< {full}");
         assert!(!s.layer_on(Layer::Furniture));
-        assert!(!s.labels().iter().any(|l| l.text.contains("m²")));
+        assert!(
+            !s.labels()
+                .iter()
+                .any(|l| l.sub.as_deref().is_some_and(|s| s.contains("m²")))
+        );
     }
 
     #[test]
@@ -8426,13 +9893,21 @@ mod tests {
         let mut s = empty();
         draw_rect(&mut s);
         let labels = s.labels();
-        assert_eq!(labels.len(), 5, "4 walls + 1 room");
+        assert_eq!(labels.len(), 13, "4 walls + 8 chain labels + 1 room");
         assert!(labels.iter().any(|l| l.text.starts_with("房间")));
-        assert!(labels.iter().any(|l| l.text.contains("m²")));
+        assert!(
+            labels
+                .iter()
+                .any(|l| l.sub.as_deref().is_some_and(|s| s.contains("m²")))
+        );
+        assert!(labels.iter().any(|l| l.text.starts_with("X ")));
+        assert!(labels.iter().any(|l| l.text.starts_with("Y ")));
         s.doc.settings.show_dimensions = false;
         let labels = s.labels();
         assert!(
-            labels.iter().all(|l| l.text.contains("m²")),
+            labels
+                .iter()
+                .all(|l| l.sub.as_deref().is_some_and(|s| s.contains("m²"))),
             "only room labels"
         );
     }
@@ -8589,6 +10064,29 @@ mod tests {
     }
 
     #[test]
+    fn recompute_rooms_names_a_narrow_hall_as_corridor() {
+        let mut doc = Document::new("corridor");
+        let corners = [
+            (Pt::new(0, 0), Pt::new(4000, 0)),
+            (Pt::new(4000, 0), Pt::new(4000, 1200)),
+            (Pt::new(4000, 1200), Pt::new(0, 1200)),
+            (Pt::new(0, 1200), Pt::new(0, 0)),
+        ];
+        for (i, (a, b)) in corners.into_iter().enumerate() {
+            doc.walls.push(Wall::new(
+                EntityId(100 + i as u128),
+                a,
+                b,
+                120,
+                WallKind::Partition,
+            ));
+        }
+        recompute_rooms(&mut doc);
+        assert_eq!(doc.rooms.len(), 1);
+        assert_eq!(doc.rooms[0].name, "过道");
+    }
+
+    #[test]
     fn place_door_and_undo() {
         let mut s = empty();
         draw_wall(&mut s);
@@ -8611,6 +10109,22 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_window_selects_the_opening_not_the_host_wall() {
+        let mut s = empty();
+        draw_wall(&mut s);
+        s.set_tool(Tool::Window);
+        s.pointer_down([400.0, 400.0], PointerButton::Left, false);
+        s.set_tool(Tool::Select);
+        s.pointer_move([400.0, 400.0]);
+        assert!(s.hover.is_none(), "window must not hover-paint the wall");
+        assert!(s.hover_opening.is_some());
+        s.pointer_down([400.0, 400.0], PointerButton::Left, false);
+        assert!(s.selected_opening.is_some(), "window receives the click");
+        assert!(s.selection.is_empty(), "host wall must not stay selected");
+        assert!(s.selected_wall_id().is_none());
+    }
+
+    #[test]
     fn box_select_picks_walls_inside() {
         let mut s = empty();
         draw_wall(&mut s);
@@ -8619,6 +10133,22 @@ mod tests {
         s.pointer_move([650.0, 500.0]);
         s.pointer_up([650.0, 500.0], PointerButton::Left, false);
         assert_eq!(s.selection.len(), 1);
+    }
+
+    #[test]
+    fn box_select_picks_furniture_inside() {
+        let mut s = empty();
+        s.place_furniture_at(0, [500.0, 400.0]);
+        s.set_tool(Tool::Select);
+        s.pointer_down([380.0, 300.0], PointerButton::Left, false);
+        s.pointer_move([620.0, 500.0]);
+        s.pointer_up([620.0, 500.0], PointerButton::Left, false);
+        assert_eq!(
+            s.furniture_selection.len(),
+            1,
+            "marquee must collect furniture, not only walls"
+        );
+        assert_eq!(s.selected_furniture, Some(s.furniture_selection[0]));
     }
     #[test]
     fn walk_spawns_inside_the_largest_room() {

@@ -24,7 +24,8 @@ pub const ROOM_JOIN_TOLERANCE_MM: Mm = 160;
 /// - `min_area_m2`: faces smaller than this are discarded (default 0.3 m²).
 pub fn detect_rooms(segments: &[(Pt, Pt)], tolerance_mm: Mm, min_area_m2: f64) -> Vec<Vec<Pt>> {
     let welded = weld_segments(segments, tolerance_mm);
-    let split = split_at_intersections(&welded);
+    let split = split_at_intersections(&welded, tolerance_mm);
+
     if split.is_empty() {
         return Vec::new();
     }
@@ -306,16 +307,18 @@ fn lerp(a: Pt, b: Pt, t: f64) -> Pt {
     )
 }
 
-fn split_at_intersections(segments: &[(Pt, Pt)]) -> Vec<(Pt, Pt)> {
+fn split_at_intersections(segments: &[(Pt, Pt)], tolerance_mm: Mm) -> Vec<(Pt, Pt)> {
     let mut out = Vec::new();
     for (i, (a, b)) in segments.iter().enumerate() {
         let mut ts = vec![0.0f64, 1.0];
+        let len = ((b.x - a.x) as f64).hypot((b.y - a.y) as f64);
+        let edge_tol = (tolerance_mm.max(1) as f64 / len.max(1.0)).clamp(EPS, 0.5);
         for (j, (c, d)) in segments.iter().enumerate() {
             if i == j {
                 continue;
             }
-            for t in intersection_params(*a, *b, *c, *d) {
-                if t > EPS && t < 1.0 - EPS {
+            for t in intersection_params(*a, *b, *c, *d, tolerance_mm) {
+                if t > edge_tol && t < 1.0 - edge_tol {
                     ts.push(t);
                 }
             }
@@ -333,7 +336,7 @@ fn split_at_intersections(segments: &[(Pt, Pt)]) -> Vec<(Pt, Pt)> {
     out
 }
 
-fn intersection_params(a: Pt, b: Pt, c: Pt, d: Pt) -> Vec<f64> {
+fn intersection_params(a: Pt, b: Pt, c: Pt, d: Pt, tolerance_mm: Mm) -> Vec<f64> {
     let ax = a.x as f64;
     let ay = a.y as f64;
     let rx = (b.x - a.x) as f64;
@@ -365,7 +368,11 @@ fn intersection_params(a: Pt, b: Pt, c: Pt, d: Pt) -> Vec<f64> {
 
     let t = cross(qpx, qpy, sx, sy) / denom;
     let u = cross(qpx, qpy, rx, ry) / denom;
-    if (-EPS..=1.0 + EPS).contains(&t) && (-EPS..=1.0 + EPS).contains(&u) {
+    let r_len = (rx * rx + ry * ry).sqrt().max(1.0);
+    let s_len = (sx * sx + sy * sy).sqrt().max(1.0);
+    let t_tol = tolerance_mm.max(1) as f64 / r_len;
+    let u_tol = tolerance_mm.max(1) as f64 / s_len;
+    if (-t_tol..=1.0 + t_tol).contains(&t) && (-u_tol..=1.0 + u_tol).contains(&u) {
         vec![t.clamp(0.0, 1.0)]
     } else {
         Vec::new()
@@ -457,6 +464,24 @@ mod tests {
             1,
             "small drafting gap should not erase the room"
         );
+    }
+
+    #[test]
+    fn a_sloped_wall_t_junction_is_split_when_projection_rounds() {
+        // The top wall is 40 mm higher at its right end. A partition ending
+        // at y=0 is 20 mm off that line, so its projected endpoint is also
+        // rounded 20 mm off the line. The old exact-intersection test missed
+        // this T-junction and merged the two rooms into one self-intersecting
+        // face.
+        let segs = vec![
+            (Pt::new(0, 0), Pt::new(10000, 40)),
+            (Pt::new(10000, 40), Pt::new(10000, 8000)),
+            (Pt::new(10000, 8000), Pt::new(0, 8000)),
+            (Pt::new(0, 8000), Pt::new(0, 0)),
+            (Pt::new(5000, 0), Pt::new(5000, 8000)),
+        ];
+        let rooms = detect_rooms(&segs, ROOM_JOIN_TOLERANCE_MM, 0.3);
+        assert_eq!(rooms.len(), 2, "rounded T-junction must split the plan");
     }
 
     #[test]

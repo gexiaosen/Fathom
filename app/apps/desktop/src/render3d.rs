@@ -717,8 +717,7 @@ impl Renderer3d {
         pass.set_pipeline(&self.shadow_pipeline);
         pass.set_bind_group(0, &self.shadow_bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
-        // The ground slab is the first six vertices; it must not shadow itself.
-        pass.draw(6..split as u32, 0..1);
+        pass.draw(0..split as u32, 0..1);
         drop(pass);
         queue.submit(Some(shadow_enc.finish()));
     }

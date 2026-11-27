@@ -354,18 +354,57 @@ pub fn floor_mesh(rooms: &[Room], materials: &[Material]) -> Vec<MeshVertex> {
         let color = material.map(material_color).unwrap_or(FLOOR_FALLBACK);
         let pattern = material.map(|m| finish_pattern(&m.kind)).unwrap_or(0.0);
         let roughness = material.map(|m| finish_roughness(&m.kind)).unwrap_or(0.9);
+        // Bay windows are not counted as usable rooms; they are raised sills
+        // (about 450 mm) rather than ordinary floor slabs.
+        let y = if room.counted { 0.0 } else { 0.45 };
         for tri in fp_geom::triangulate(&room.polygon) {
             let a = to_m(tri[0]);
             let b = to_m(tri[1]);
             let c = to_m(tri[2]);
             for v in [a, b, c] {
                 out.push(MeshVertex::with_pattern(
-                    [v[0], 0.0, v[1]],
+                    [v[0], y, v[1]],
                     [0.0, 1.0, 0.0],
                     color,
                     [roughness, 0.0, 0.0],
                     pattern,
                 ));
+            }
+        }
+        if y > 0.0 {
+            let ccw = fp_geom::signed_area(&room.polygon) > 0.0;
+            for i in 0..room.polygon.len() {
+                let a = room.polygon[i];
+                let b = room.polygon[(i + 1) % room.polygon.len()];
+                let dx = b.x as f32 - a.x as f32;
+                let dy = b.y as f32 - a.y as f32;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len < 1.0 {
+                    continue;
+                }
+                let n = if ccw {
+                    [dy / len, 0.0, -dx / len]
+                } else {
+                    [-dy / len, 0.0, dx / len]
+                };
+                let am = to_m(a);
+                let bm = to_m(b);
+                for v in [
+                    [am[0], 0.0, am[1]],
+                    [bm[0], 0.0, bm[1]],
+                    [bm[0], y, bm[1]],
+                    [am[0], 0.0, am[1]],
+                    [bm[0], y, bm[1]],
+                    [am[0], y, am[1]],
+                ] {
+                    out.push(MeshVertex::with_pattern(
+                        v,
+                        n,
+                        [0.86, 0.84, 0.80],
+                        [0.86, 0.0, 0.0],
+                        0.0,
+                    ));
+                }
             }
         }
     }
@@ -892,9 +931,19 @@ pub fn scene_mesh_full(
     furniture: &[Furniture],
 ) -> MeshParts {
     let mut scene = MeshParts::new();
-    scene.push_opaque(ground_mesh());
     scene.push_opaque(wall_mesh_with_finishes(walls, openings, materials));
     scene.push_opaque(floor_mesh(rooms, materials));
+    for opening in openings {
+        let Some(wall) = walls.iter().find(|w| w.id == opening.wall_id) else {
+            continue;
+        };
+        match opening.kind {
+            OpeningKind::Door => scene.push_opaque(door_leaf_mesh(wall, opening, 0.0)),
+            OpeningKind::Bay => scene.push_mixed(bay_window_parts(wall, opening, rooms)),
+            _ => {}
+        }
+    }
+    scene.push_opaque(opening_frame_mesh(walls, openings));
     scene.push_mixed(furniture_mesh_parts(furniture));
     scene.push_glass(opening_glass_mesh(walls, openings));
     scene
@@ -902,12 +951,12 @@ pub fn scene_mesh_full(
 
 /// Thin glass panes across every window-like opening.
 pub fn opening_glass_mesh(walls: &[Wall], openings: &[Opening]) -> Vec<MeshVertex> {
-    let color = [0.62, 0.76, 0.80];
+    let color = [0.55, 0.72, 0.78];
     let mat = [0.04, 0.0, 0.0];
     let alpha = 0.16;
     let mut out = Vec::new();
     for opening in openings {
-        if opening.kind == OpeningKind::Door {
+        if matches!(opening.kind, OpeningKind::Door | OpeningKind::Bay) {
             continue;
         }
         let Some(wall) = walls.iter().find(|w| w.id == opening.wall_id) else {
@@ -942,6 +991,248 @@ pub fn opening_glass_mesh(walls: &[Wall], openings: &[Opening]) -> Vec<MeshVerte
         }
     }
     out
+}
+
+/// Thin dark frame around doors and windows. The frame is what makes an
+/// opening readable in the cut-away view, where the wall itself is only 1.35 m
+/// tall and a glass pane alone would disappear into the pale wall.
+pub fn opening_frame_mesh(walls: &[Wall], openings: &[Opening]) -> Vec<MeshVertex> {
+    const FRAME: SurfaceStyle = ([0.23, 0.24, 0.25], [0.35, 0.0, 0.0], 12.0);
+    let mut out = Vec::new();
+    for opening in openings {
+        if opening.kind == OpeningKind::Bay {
+            continue;
+        }
+        let Some(wall) = walls.iter().find(|w| w.id == opening.wall_id) else {
+            continue;
+        };
+        let len =
+            ((wall.end.x - wall.start.x) as f64).hypot((wall.end.y - wall.start.y) as f64) / 1000.0;
+        if len < 1e-4 || opening.width_mm <= 0 || opening.height_mm <= 0 {
+            continue;
+        }
+        let dir = [
+            (wall.end.x - wall.start.x) as f32 / (len as f32 * 1000.0),
+            (wall.end.y - wall.start.y) as f32 / (len as f32 * 1000.0),
+        ];
+        let a = [wall.start.x as f32 / 1000.0, wall.start.y as f32 / 1000.0];
+        let half = wall.thickness_mm as f32 / 2000.0;
+        let n = [-dir[1], dir[0]];
+        let s = opening.offset_mm as f32 / 1000.0;
+        let e = (opening.offset_mm + opening.width_mm) as f32 / 1000.0;
+        let y0 = opening.sill_mm as f32 / 1000.0;
+        let y1 = (opening.sill_mm + opening.height_mm) as f32 / 1000.0;
+        let p = |t: f32, off: f32| {
+            [
+                a[0] + dir[0] * t + n[0] * off,
+                a[1] + dir[1] * t + n[1] * off,
+            ]
+        };
+        let bar = 0.025;
+        let depth = half * 0.92;
+        // Jambs: short beams across the wall thickness at both ends.
+        for t in [s, e] {
+            box_segment_styled(&mut out, p(t, depth), p(t, -depth), bar, y0, y1, FRAME);
+        }
+        // Head and sill rails, kept inside the opening so the cut faces stay
+        // clean.
+        for (lo, hi) in [(y0, y0 + bar * 2.0), (y1 - bar * 2.0, y1)] {
+            box_segment_styled(&mut out, p(s, 0.0), p(e, 0.0), depth, lo, hi, FRAME);
+        }
+        if opening.width_mm >= 1200 {
+            box_segment_styled(
+                &mut out,
+                p((s + e) * 0.5, depth),
+                p((s + e) * 0.5, -depth),
+                bar,
+                y0,
+                y1,
+                FRAME,
+            );
+        }
+    }
+    out
+}
+
+/// A box-bay window: a shallow glazed volume projecting to the outdoor side of
+/// its host wall, with a solid sill slab, corner posts and a dark frame.
+pub fn bay_window_parts(wall: &Wall, opening: &Opening, rooms: &[Room]) -> MeshParts {
+    let mut parts = MeshParts::new();
+    let len =
+        ((wall.end.x - wall.start.x) as f64).hypot((wall.end.y - wall.start.y) as f64) / 1000.0;
+    if len < 1e-4 || opening.width_mm <= 0 || opening.height_mm <= 0 {
+        return parts;
+    }
+    let dir = [
+        (wall.end.x - wall.start.x) as f32 / (len as f32 * 1000.0),
+        (wall.end.y - wall.start.y) as f32 / (len as f32 * 1000.0),
+    ];
+    let a = [wall.start.x as f32 / 1000.0, wall.start.y as f32 / 1000.0];
+    let n = [-dir[1], dir[0]];
+    let s = opening.offset_mm as f32 / 1000.0;
+    let e = (opening.offset_mm + opening.width_mm) as f32 / 1000.0;
+    let y0 = opening.sill_mm as f32 / 1000.0;
+    let y1 = (opening.sill_mm + opening.height_mm) as f32 / 1000.0;
+    if e - s < 0.25 || y1 - y0 < 0.12 {
+        return parts;
+    }
+    let mid = (s + e) * 0.5;
+    let depth = 0.55f32;
+    let probe = 0.35f32;
+    let plus = [
+        a[0] + dir[0] * mid + n[0] * probe,
+        a[1] + dir[1] * mid + n[1] * probe,
+    ];
+    let minus = [
+        a[0] + dir[0] * mid - n[0] * probe,
+        a[1] + dir[1] * mid - n[1] * probe,
+    ];
+    let inside = |point: [f32; 2]| {
+        rooms.iter().any(|room| {
+            fp_geom::point_in_polygon(
+                Pt::new(
+                    (point[0] * 1000.0).round() as i32,
+                    (point[1] * 1000.0).round() as i32,
+                ),
+                &room.polygon,
+            )
+        })
+    };
+    let side = if inside(plus) && !inside(minus) {
+        -1.0
+    } else {
+        1.0
+    };
+    let p = |t: f32, off: f32| {
+        [
+            a[0] + dir[0] * t + n[0] * side * off,
+            a[1] + dir[1] * t + n[1] * side * off,
+        ]
+    };
+    let wall_style = wall_surface_style(wall, &[]);
+    let sill_style = ([0.68, 0.65, 0.60], [0.72, 0.0, 0.0], 0.0);
+    let frame_style = ([0.23, 0.24, 0.25], [0.35, 0.0, 0.0], 12.0);
+    let frame = 0.045f32;
+    let mut opaque = Vec::new();
+
+    // Sill slab and, unless the cut-away already cuts through it, the head.
+    box_segment_styled(
+        &mut opaque,
+        p(mid, 0.0),
+        p(mid, depth),
+        (e - s) * 0.5,
+        (y0 - 0.09).max(0.01),
+        y0,
+        sill_style,
+    );
+    let host_top = wall.height_mm as f32 / 1000.0;
+    if y1 + 0.06 < host_top - 0.01 {
+        box_segment_styled(
+            &mut opaque,
+            p(mid, 0.0),
+            p(mid, depth),
+            (e - s) * 0.5,
+            y1,
+            y1 + 0.06,
+            wall_style,
+        );
+    }
+    // Four corner posts make the box read as a bay rather than a floating pane.
+    for t in [s + 0.03, e - 0.03] {
+        box_segment_styled(
+            &mut opaque,
+            p(t, 0.02),
+            p(t, depth - 0.02),
+            0.03,
+            y0,
+            y1,
+            frame_style,
+        );
+    }
+    // Front rails and mullion.
+    for (lo, hi) in [(y0, y0 + frame), (y1 - frame, y1)] {
+        box_segment_styled(
+            &mut opaque,
+            p(s, depth),
+            p(e, depth),
+            0.025,
+            lo,
+            hi,
+            frame_style,
+        );
+    }
+    if e - s >= 1.2 {
+        box_segment_styled(
+            &mut opaque,
+            p(mid, depth),
+            p(mid, depth - 0.02),
+            0.02,
+            y0,
+            y1,
+            frame_style,
+        );
+    }
+    // Side rails at the two returns.
+    for t in [s + 0.03, e - 0.03] {
+        for (lo, hi) in [(y0, y0 + frame), (y1 - frame, y1)] {
+            box_segment_styled(
+                &mut opaque,
+                p(t, 0.02),
+                p(t, depth - 0.02),
+                0.025,
+                lo,
+                hi,
+                frame_style,
+            );
+        }
+    }
+    parts.push_opaque(opaque);
+
+    let mut glass = Vec::new();
+    let gy0 = y0 + frame;
+    let gy1 = y1 - frame;
+    if gy1 > gy0 {
+        // Front pane.
+        let a0 = p(s + frame, depth - 0.015);
+        let a1 = p(e - frame, depth - 0.015);
+        let n_front = [n[0] * side, 0.0, n[1] * side];
+        let b0 = [a0[0], gy0, a0[1]];
+        let b1 = [a1[0], gy0, a1[1]];
+        let c1 = [a1[0], gy1, a1[1]];
+        let c0 = [a0[0], gy1, a0[1]];
+        glass_quad(&mut glass, b0, b1, c1, c0, n_front);
+        // Two side panes.
+        for (t, normal) in [
+            (s + 0.02, [-dir[0], 0.0, -dir[1]]),
+            (e - 0.02, [dir[0], 0.0, dir[1]]),
+        ] {
+            let near = p(t, 0.05);
+            let far = p(t, depth - 0.03);
+            let q0 = [near[0], gy0, near[1]];
+            let q1 = [far[0], gy0, far[1]];
+            let q2 = [far[0], gy1, far[1]];
+            let q3 = [near[0], gy1, near[1]];
+            glass_quad(&mut glass, q0, q1, q2, q3, normal);
+        }
+    }
+    parts.push_glass(glass);
+    parts
+}
+
+fn glass_quad(
+    out: &mut Vec<MeshVertex>,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    d: [f32; 3],
+    normal: [f32; 3],
+) {
+    const GLASS: [f32; 3] = [0.62, 0.76, 0.80];
+    for pos in [a, b, c, a, c, d] {
+        let mut v = MeshVertex::with_alpha(pos, normal, GLASS, [0.04, 0.0, 0.0], 0.16);
+        v.pattern = 8.008;
+        out.push(v);
+    }
 }
 
 fn to_m(p: Pt) -> [f32; 2] {
@@ -1040,6 +1331,51 @@ mod tests {
             floor: 0,
             ceiling_material_id: None,
         }
+    }
+
+    #[test]
+    fn bay_room_floor_is_raised_and_has_a_side_face() {
+        let mut bay = room();
+        bay.counted = false;
+        let mesh = floor_mesh(&[bay], &[]);
+        let max_y = mesh.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+        assert!((max_y - 0.45).abs() < 1e-4, "bay sill height {max_y}");
+        assert!(mesh.iter().any(|v| v.pos[1] < 0.01), "bay needs sides");
+    }
+
+    #[test]
+    fn bay_window_projects_outside_the_room_with_glass() {
+        let opening = Opening {
+            id: EntityId(3),
+            wall_id: EntityId(1),
+            kind: OpeningKind::Bay,
+            offset_mm: 400,
+            width_mm: 1200,
+            height_mm: 1200,
+            sill_mm: 500,
+            swing_deg: 0.0,
+            hinge_right: false,
+            price: None,
+        };
+        let parts = bay_window_parts(&wall(), &opening, &[room()]);
+        assert!(parts.opaque > 0, "bay needs a sill and frame");
+        assert!(parts.vertices.len() > parts.opaque, "bay needs glass panes");
+        let min_z = parts
+            .vertices
+            .iter()
+            .map(|v| v.pos[2])
+            .fold(f32::MAX, f32::min);
+        assert!(
+            min_z < -0.4,
+            "bay should project to the outdoor side, got {min_z}"
+        );
+        assert!(
+            parts
+                .vertices
+                .iter()
+                .any(|v| v.alpha < 0.999 && v.pattern > 8.0),
+            "bay needs a glass pane"
+        );
     }
 
     #[test]

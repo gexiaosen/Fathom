@@ -21,7 +21,7 @@ mod update;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -219,16 +219,19 @@ impl PlanEditor {
             return true;
         }
         // Top-right menus.
-        if self.more_open && pos[0] >= w - 250.0 && pos[1] <= 310.0 {
+        if self.more_open && pos[0] >= w - 250.0 && pos[1] <= 575.0 {
             return true;
         }
-        if self.export_open && pos[0] >= w - 380.0 && pos[1] <= 340.0 {
+        if self.export_open && pos[0] >= w - 380.0 && pos[1] <= 430.0 {
             return true;
         }
         if self.library_open && pos[0] <= 334.0 && pos[1] >= 96.0 && pos[1] <= 700.0 {
             return true;
         }
-        if self.layers_open && pos[0] <= 300.0 && pos[1] >= h - 390.0 {
+        if self.layers_open
+            && pos[0] <= 270.0
+            && (pos[1] >= h - 390.0 || (pos[1] >= 452.0 && pos[1] <= 805.0))
+        {
             return true;
         }
         match view {
@@ -499,7 +502,7 @@ impl PlanEditor {
             return;
         }
         if cmd && key == "s" {
-            self.state.lock().unwrap().save_now();
+            self.save_plan(shift, cx);
             cx.notify();
             return;
         }
@@ -1231,12 +1234,57 @@ impl PlanEditor {
         cx.notify();
 
         match update::install_and_relaunch(&prepared.staged_app, &prepared.destination) {
-            Ok(()) => cx.quit(),
+            Ok(()) => {
+                #[cfg(target_os = "macos")]
+                ALLOW_TERMINATE.store(true, std::sync::atomic::Ordering::Release);
+                cx.quit()
+            }
             Err(err) => {
                 self.update_phase = UpdatePhase::Failed(err);
                 cx.notify();
             }
         }
+    }
+
+    /// Save the plan. Untitled documents (and explicit Save As) ask for a
+    /// file name; the chosen stem becomes the plan name. Returns false when
+    /// the user cancelled or the write failed.
+    fn save_plan(&mut self, force_dialog: bool, cx: &mut Context<Self>) -> bool {
+        let needs_name = {
+            let state = self.state.lock().unwrap();
+            state.is_untitled()
+        };
+        if !force_dialog && !needs_name {
+            let mut state = self.state.lock().unwrap();
+            state.save_now();
+            let ok = !state.is_dirty();
+            drop(state);
+            cx.notify();
+            return ok;
+        }
+
+        let suggested = {
+            let state = self.state.lock().unwrap();
+            let name = state.doc.meta.name.trim();
+            if name.is_empty() {
+                "未命名方案.json".to_string()
+            } else {
+                format!("{}.json", name.replace(['/', '\\', ':'], "-"))
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Floorplan JSON", &["json"])
+            .set_file_name(&suggested)
+            .save_file()
+        else {
+            return false;
+        };
+        let mut state = self.state.lock().unwrap();
+        state.save_as(path);
+        let ok = !state.is_dirty();
+        drop(state);
+        cx.notify();
+        ok
     }
 
     fn create_new(&mut self, kind: templates::TemplateKind, cx: &mut Context<Self>) {
@@ -1583,7 +1631,7 @@ impl Render for PlanEditor {
             || self.floor_open
             || self.materials_open;
         self.state.lock().unwrap().modal_clear = modal_open;
-        let (layer_flags, measure_count, furniture_count) = {
+        let (layer_flags, measure_count, furniture_count, wall_stats) = {
             let state = self.state.lock().unwrap();
             (
                 [
@@ -1591,11 +1639,13 @@ impl Render for PlanEditor {
                     state.layer_on(Layer::Furniture),
                     state.layer_on(Layer::Grid),
                     state.layer_on(Layer::Dimensions),
+                    state.layer_on(Layer::DimensionChains),
                     state.layer_on(Layer::Bearing),
                     state.layer_on(Layer::Underlay),
                 ],
                 state.measure_count(),
                 state.furniture_count(),
+                state.wall_stats(),
             )
         };
         let (library_category, catalog_index, furniture_armed) = {
@@ -1678,8 +1728,10 @@ impl Render for PlanEditor {
                     .flex()
                     .items_center()
                     .gap(px(12.0))
-                    .child(brand_badge())
-                    .child(doc_chip(doc_name.clone(), plan_area, lang, cx))
+                    .child(brand_badge(
+                        self.viewport[0] > 400.0 && self.viewport[0] < 1120.0,
+                    ))
+                    .child(doc_chip(doc_name.clone(), plan_area, dirty, lang, cx))
                     .child(floor_chip(floor_name.clone(), floor_total, lang, cx))
                     .when(plan_empty, |el| {
                         let empty_weak = cx.entity().downgrade();
@@ -1695,7 +1747,7 @@ impl Render for PlanEditor {
                                 .items_center()
                                 .gap(px(5.0))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgba(0xffffff)))
+                                .hover(|style| style.bg(rgb(0xffffff)))
                                 .child(ui_icon(ICON_EXPORT, 11.0, ACCENT))
                                 .child(
                                     div()
@@ -1782,7 +1834,6 @@ impl Render for PlanEditor {
                             .bg(rgba(CHROME_BORDER)),
                     )
                     .child(save_chrome_button(dirty, cx))
-                    .child(quote_chrome_button(quote_open, cx))
                     .child(chrome_button(ICON_EXPORT, export_open, cx, chrome_export))
                     .child(chrome_button_with_badge(
                         ICON_MORE,
@@ -1790,12 +1841,6 @@ impl Render for PlanEditor {
                         update_available.is_some(),
                         cx,
                         chrome_more,
-                    ))
-                    .child(chrome_button(
-                        if night { ICON_MOON } else { ICON_SUN },
-                        night,
-                        cx,
-                        chrome_theme,
                     )),
             )
             // ------------------------------------------------------------------
@@ -1899,15 +1944,36 @@ impl Render for PlanEditor {
                     .inset_0()
                     .children(labels.into_iter().map(|l| {
                         let size = if l.bold { 12.0 } else { 10.0 };
+                        let width = if l.sub.is_some() { 104.0 } else { 80.0 };
+                        let top = if l.sub.is_some() { 11.0 } else { 7.0 };
                         div()
                             .absolute()
-                            .left(px(l.pos[0] - 40.0))
-                            .top(px(l.pos[1] - 7.0))
-                            .w(px(80.0))
+                            .left(px(l.pos[0] - width * 0.5))
+                            .top(px(l.pos[1] - top))
+                            .w(px(width))
                             .text_center()
+                            .flex()
+                            .flex_col()
+                            .items_center()
                             .text_size(px(size))
                             .text_color(if l.bold { rgb(0x4a4f5c) } else { rgb(0x8a8f9c) })
-                            .child(SharedString::from(l.text))
+                            .child(
+                                div()
+                                    .max_w_full()
+                                    .truncate()
+                                    .child(SharedString::from(l.text)),
+                            )
+                            .when(l.sub.is_some(), |el| {
+                                el.child(
+                                    div()
+                                        .mt(px(1.0))
+                                        .text_size(px(8.5))
+                                        .text_color(rgb(PANEL_MUTED))
+                                        .child(SharedString::from(
+                                            l.sub.clone().unwrap_or_default(),
+                                        )),
+                                )
+                            })
                     })),
             )
             .child(
@@ -2024,7 +2090,16 @@ impl Render for PlanEditor {
                 div().into_any_element()
             })
             .child(if view == ViewMode::Plan && layers_open {
-                layers_panel(true, layer_flags, measure_count, furniture_count, lang, cx)
+                layers_panel(
+                    true,
+                    layer_flags,
+                    measure_count,
+                    furniture_count,
+                    wall_stats,
+                    self.viewport[1],
+                    lang,
+                    cx,
+                )
             } else {
                 div().into_any_element()
             })
@@ -2299,7 +2374,7 @@ impl Render for PlanEditor {
                                         .text_size(px(11.5))
                                         .font_weight(wgpui::FontWeight::SEMIBOLD)
                                         .text_color(rgb(PANEL_TEXT))
-                                        .child(t.s("导出", "Export")),
+                                        .child(t.s("导出与报价", "Export & quote")),
                                 )
                                 .child(
                                     div()
@@ -2329,12 +2404,16 @@ impl Render for PlanEditor {
                                 .py(px(4.0))
                                 .flex()
                                 .flex_col()
+                                .child(menu_section(t.s("报价", "Quote")))
                                 .child(quote_menu_button(lang, cx))
+                                .child(menu_section(t.s("图纸", "Drawings")))
                                 .child(export_button(lang, cx))
                                 .child(export_pdf_button(lang, cx))
                                 .child(export_construction_button(lang, cx))
                                 .child(export_svg_button(lang, cx))
+                                .child(menu_section(t.s("数据", "Data")))
                                 .child(export_bom_button(lang, cx))
+                                .child(menu_section(t.s("三维", "3D")))
                                 .child(export_3d_button(lang, cx)),
                         )
                         .with_animation(
@@ -2350,6 +2429,40 @@ impl Render for PlanEditor {
             .when(more_open, |el| {
                 let lang_toggle = more_weak.clone();
                 let materials_weak = more_weak.clone();
+                let recent_rows: Vec<AnyElement> = self
+                    .recent_plans
+                    .iter()
+                    .take(3)
+                    .map(|plan| {
+                        let open = more_weak.clone();
+                        let path = plan.path.clone();
+                        div()
+                            .h(px(33.0))
+                            .px(px(11.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(9.0))
+                            .text_size(px(10.5))
+                            .text_color(rgb(PANEL_TEXT))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgba(0x2328331c)))
+                            .child(ui_icon(ICON_FOLDER, 14.0, PANEL_MUTED))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .child(SharedString::from(plan.name.clone())),
+                            )
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+                                if let Some(entity) = open.upgrade() {
+                                    entity.update(cx, |this, cx| {
+                                        this.more_open = false;
+                                        this.open_recent(path.clone(), cx);
+                                    });
+                                }
+                            })
+                            .into_any_element()
+                    })
+                    .collect();
                 el.child(
                     div()
                         .absolute()
@@ -2377,7 +2490,7 @@ impl Render for PlanEditor {
                                         .text_size(px(11.5))
                                         .font_weight(wgpui::FontWeight::SEMIBOLD)
                                         .text_color(rgb(PANEL_TEXT))
-                                        .child(t.s("更多", "More")),
+                                        .child(t.s("菜单", "Menu")),
                                 )
                                 .child(
                                     div()
@@ -2407,9 +2520,18 @@ impl Render for PlanEditor {
                                 .py(px(4.0))
                                 .flex()
                                 .flex_col()
+                                .child(menu_section(t.s("方案", "Plan")))
                                 .child(new_button(t.s("新建方案", "New plan"), cx))
                                 .child(file_button(t.s("打开方案", "Open"), cx, true))
+                                .child(file_button(t.s("另存为", "Save as"), cx, false))
+                                .child(plan_info_button(t.s("方案信息", "Plan info"), cx))
+                                .when(!recent_rows.is_empty(), |el| {
+                                    el.child(menu_section(t.s("最近方案", "Recent")))
+                                        .children(recent_rows)
+                                })
+                                .child(menu_section(t.s("导入", "Import")))
                                 .child(import_button(t.s("导入底图", "Import"), cx))
+                                .child(menu_section(t.s("资源", "Resources")))
                                 .child(
                                     div()
                                         .h(px(33.0))
@@ -2433,14 +2555,7 @@ impl Render for PlanEditor {
                                             },
                                         ),
                                 )
-                                .child(file_button(t.s("另存为", "Save as"), cx, false))
-                                .child(
-                                    div()
-                                        .h(px(1.0))
-                                        .mx(px(6.0))
-                                        .my(px(4.0))
-                                        .bg(rgba(CHROME_BORDER)),
-                                )
+                                .child(menu_section(t.s("应用", "App")))
                                 .child(
                                     div()
                                         .h(px(33.0))
@@ -2477,14 +2592,22 @@ impl Render for PlanEditor {
                                             },
                                         ),
                                 )
+                                .child(update_button(t, update_available.clone(), cx))
                                 .child(
                                     div()
-                                        .h(px(1.0))
-                                        .mx(px(6.0))
-                                        .my(px(4.0))
-                                        .bg(rgba(CHROME_BORDER)),
-                                )
-                                .child(update_button(t, update_available.clone(), cx)),
+                                        .h(px(26.0))
+                                        .px(px(12.0))
+                                        .border_t_1()
+                                        .border_color(rgba(CHROME_BORDER))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(8.5))
+                                        .text_color(rgb(PANEL_MUTED))
+                                        .child(SharedString::from(format!(
+                                            "Fathom {}",
+                                            update::current_version()
+                                        ))),
+                                ),
                         )
                         .with_animation(
                             "more-menu-in",
@@ -2623,9 +2746,9 @@ const ROW_BG: u32 = 0x2328330d;
 
 const CHROME_BG: u32 = 0xfdfcf9e6;
 const CHROME_BORDER: u32 = 0x23283321;
-const ACCENT: u32 = 0x252b36;
-const ACCENT_SOFT: u32 = 0x23283314;
-const ACCENT_LINE: u32 = 0x23283333;
+const ACCENT: u32 = 0x2f6fed;
+const ACCENT_SOFT: u32 = 0x2f6fed1c;
+const ACCENT_LINE: u32 = 0x2f6fed61;
 const GOOD: u32 = 0x5f6878;
 const DOT_MUTED: u32 = 0x98a0ad;
 const DANGER: u32 = 0xbd4a41;
@@ -2940,40 +3063,6 @@ fn chrome_button(
 
 /// The quote entry: a visible ¥ in the top bar so the price is never buried in
 /// the room inspector again.
-fn quote_chrome_button(active: bool, cx: &mut Context<PlanEditor>) -> impl IntoElement {
-    let state = cx.entity().downgrade();
-    let fg = if active { ACCENT } else { PANEL_TEXT };
-    div()
-        .w(px(30.0))
-        .h(px(30.0))
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(if active {
-            rgba(ACCENT_SOFT)
-        } else {
-            rgba(0x00000000)
-        })
-        .border_1()
-        .border_color(if active {
-            rgba(ACCENT_LINE)
-        } else {
-            rgba(0x00000000)
-        })
-        .text_size(px(14.0))
-        .font_weight(wgpui::FontWeight::SEMIBOLD)
-        .text_color(rgb(fg))
-        .hover(|style| style.bg(rgba(0x23283318)).border_color(rgba(0x23283320)))
-        .child(SharedString::from("¥"))
-        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-            if let Some(entity) = state.upgrade() {
-                entity.update(cx, |this, cx| this.open_quote(window, cx));
-            }
-        })
-}
-
 fn chrome_button_with_badge(
     icon: &'static str,
     active: bool,
@@ -3060,14 +3149,14 @@ fn save_chrome_button(dirty: bool, cx: &mut Context<PlanEditor>) -> impl IntoEle
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
             if let Some(entity) = state.upgrade() {
                 entity.update(cx, |this, cx| {
-                    this.state.lock().unwrap().save_now();
+                    this.save_plan(false, cx);
                     cx.notify();
                 });
             }
         })
 }
 
-fn brand_badge() -> impl IntoElement {
+fn brand_badge(compact: bool) -> impl IntoElement {
     div()
         .h(px(30.0))
         .flex()
@@ -3085,30 +3174,33 @@ fn brand_badge() -> impl IntoElement {
                 .shadow_sm()
                 .child(logo_mark(18.0, 15.5, 0xffffff)),
         )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_weight(wgpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(PANEL_TEXT))
-                        .child(SharedString::from("Fathom")),
-                )
-                .child(
-                    div()
-                        .mt(px(1.0))
-                        .text_size(px(9.0))
-                        .text_color(rgb(PANEL_MUTED))
-                        .child(SharedString::from("方寸")),
-                ),
-        )
+        .when(!compact, |el| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(wgpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(PANEL_TEXT))
+                            .child(SharedString::from("Fathom")),
+                    )
+                    .child(
+                        div()
+                            .mt(px(1.0))
+                            .text_size(px(9.0))
+                            .text_color(rgb(PANEL_MUTED))
+                            .child(SharedString::from("方寸")),
+                    ),
+            )
+        })
 }
 
 fn doc_chip(
     name: String,
     area: f64,
+    dirty: bool,
     lang: i18n::Lang,
     cx: &mut Context<PlanEditor>,
 ) -> impl IntoElement {
@@ -3144,6 +3236,15 @@ fn doc_chip(
                 .text_color(rgb(PANEL_TEXT))
                 .child(SharedString::from(format!("{label}{area_text}"))),
         )
+        .when(dirty, |el| {
+            el.child(
+                div()
+                    .w(px(5.0))
+                    .h(px(5.0))
+                    .rounded_full()
+                    .bg(rgb(DOT_MUTED)),
+            )
+        })
         .child(ui_icon(ICON_CHEVRON, 11.0, PANEL_MUTED))
         .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
             if let Some(entity) = weak.upgrade() {
@@ -3278,22 +3379,6 @@ fn chrome_more(this: &mut PlanEditor, _window: &mut Window, cx: &mut Context<Pla
     this.more_open = !this.more_open;
     this.export_open = false;
     this.scale_open = false;
-    cx.notify();
-}
-
-fn chrome_theme(this: &mut PlanEditor, _window: &mut Window, cx: &mut Context<PlanEditor>) {
-    let mut s = this.state.lock().unwrap();
-    let next = !s.night;
-    s.set_night(next);
-    s.note = Some(
-        if next {
-            "已切换到夜间光照"
-        } else {
-            "已切换到日间光照"
-        }
-        .into(),
-    );
-    drop(s);
     cx.notify();
 }
 
@@ -4165,7 +4250,11 @@ fn finish_action_chips(
                         .h(px(13.0))
                         .rounded(px(3.0))
                         .border_1()
-                        .border_color(rgba(if active { ACCENT } else { 0x23283318 }))
+                        .border_color(if active {
+                            rgb(ACCENT)
+                        } else {
+                            rgba(0x23283318)
+                        })
                         .bg(rgb(swatch))
                         .flex()
                         .items_center()
@@ -4598,7 +4687,11 @@ fn inspector_panel(
                                 .p(px(2.0))
                                 .rounded_full()
                                 .border_1()
-                                .border_color(rgba(if active { ACCENT } else { 0x00000000 }))
+                                .border_color(if active {
+                                    rgb(ACCENT)
+                                } else {
+                                    rgba(0x00000000)
+                                })
                                 .child(
                                     div()
                                         .w_full()
@@ -5195,6 +5288,17 @@ fn export_svg_button(lang: i18n::Lang, cx: &mut Context<PlanEditor>) -> impl Int
         })
 }
 
+fn menu_section(label: &'static str) -> impl IntoElement {
+    div()
+        .h(px(23.0))
+        .px(px(12.0))
+        .pt(px(7.0))
+        .text_size(px(8.5))
+        .font_weight(wgpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(PANEL_MUTED))
+        .child(SharedString::from(label))
+}
+
 fn new_button(label: &'static str, cx: &mut Context<PlanEditor>) -> impl IntoElement {
     let state = cx.entity().downgrade();
     div()
@@ -5569,7 +5673,7 @@ fn import_card(lang: i18n::Lang, weak: WeakEntity<PlanEditor>) -> impl IntoEleme
                 .px_2()
                 .py_1()
                 .rounded_md()
-                .bg(rgba(0xffffff))
+                .bg(rgb(0xffffff))
                 .text_size(px(9.0))
                 .text_color(rgb(ACCENT))
                 .child(t.s("先预览", "Preview first")),
@@ -5619,6 +5723,33 @@ fn template_card(
         .into_any_element()
 }
 
+fn plan_info_button(label: &'static str, cx: &mut Context<PlanEditor>) -> impl IntoElement {
+    let state = cx.entity().downgrade();
+    div()
+        .w_full()
+        .h(px(33.0))
+        .px(px(11.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(9.0))
+        .text_size(px(10.5))
+        .text_color(rgb(PANEL_TEXT))
+        .hover(|style| style.bg(rgba(0x2328331c)))
+        .child(ui_icon(ICON_INFO, 14.0, PANEL_MUTED))
+        .child(SharedString::from(label))
+        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+            if let Some(entity) = state.upgrade() {
+                entity.update(cx, |this, cx| {
+                    this.more_open = false;
+                    this.export_open = false;
+                    this.scale_open = false;
+                    this.open_project_info(window, cx);
+                });
+            }
+        })
+}
+
 fn file_button(label: &'static str, cx: &mut Context<PlanEditor>, open: bool) -> impl IntoElement {
     let state = cx.entity().downgrade();
     div()
@@ -5639,9 +5770,20 @@ fn file_button(label: &'static str, cx: &mut Context<PlanEditor>, open: bool) ->
                 .ml_auto()
                 .text_size(px(8.5))
                 .text_color(rgb(PANEL_MUTED))
-                .child(SharedString::from(if open { "⌘O" } else { "⌘S" })),
+                .child(SharedString::from(if open { "⌘O" } else { "⇧⌘S" })),
         )
         .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
+            if !open {
+                if let Some(entity) = state.upgrade() {
+                    entity.update(cx, |this, cx| {
+                        this.more_open = false;
+                        this.export_open = false;
+                        this.scale_open = false;
+                        this.save_plan(true, cx);
+                    });
+                }
+                return;
+            }
             if let Some(entity) = state.upgrade() {
                 entity.update(cx, |this, cx| {
                     this.more_open = false;
@@ -5650,12 +5792,9 @@ fn file_button(label: &'static str, cx: &mut Context<PlanEditor>, open: bool) ->
                     cx.notify();
                 });
             }
-            let dialog = rfd::FileDialog::new().add_filter("Floorplan JSON", &["json"]);
-            let picked = if open {
-                dialog.pick_file()
-            } else {
-                dialog.set_file_name("plan.json").save_file()
-            };
+            let picked = rfd::FileDialog::new()
+                .add_filter("Floorplan JSON", &["json"])
+                .pick_file();
             let Some(path) = picked else {
                 return;
             };
@@ -5663,14 +5802,7 @@ fn file_button(label: &'static str, cx: &mut Context<PlanEditor>, open: bool) ->
                 return;
             };
             entity.update(cx, |this, cx| {
-                {
-                    let mut s = this.state.lock().unwrap();
-                    if open {
-                        s.open_path(path);
-                    } else {
-                        s.save_as(path);
-                    }
-                }
+                this.state.lock().unwrap().open_path(path);
                 cx.notify();
             });
         })
@@ -6452,9 +6584,11 @@ fn view3d_panel(
 
 fn layers_panel(
     open: bool,
-    flags: [bool; 6],
+    flags: [bool; 7],
     measure_count: usize,
     furniture_count: usize,
+    wall_stats: (f64, f64, f64, f64),
+    viewport_h: f32,
     lang: i18n::Lang,
     cx: &mut Context<PlanEditor>,
 ) -> AnyElement {
@@ -6463,13 +6597,19 @@ fn layers_panel(
     }
     let weak = cx.entity().downgrade();
     let t = i18n::T(lang);
-    let definitions: [(&str, &str, bool, Layer); 6] = [
+    let definitions: [(&str, &str, bool, Layer); 7] = [
         ("房间名", "Room names", flags[0], Layer::RoomNames),
         ("家具", "Furniture", flags[1], Layer::Furniture),
         ("网格", "Grid", flags[2], Layer::Grid),
         ("尺寸标注", "Dimensions", flags[3], Layer::Dimensions),
-        ("承重墙标示", "Load bearing", flags[4], Layer::Bearing),
-        ("户型底图", "Plan underlay", flags[5], Layer::Underlay),
+        (
+            "总尺寸链",
+            "Dimension chains",
+            flags[4],
+            Layer::DimensionChains,
+        ),
+        ("承重墙标示", "Load bearing", flags[5], Layer::Bearing),
+        ("户型底图", "Plan underlay", flags[6], Layer::Underlay),
     ];
     let mut rows: Vec<AnyElement> = Vec::new();
     for (zh, en, on, layer) in definitions {
@@ -6496,7 +6636,7 @@ fn layers_panel(
                         .w(px(30.0))
                         .h(px(16.0))
                         .rounded_full()
-                        .bg(rgba(if on { ACCENT } else { 0x2328331f }))
+                        .bg(if on { rgb(ACCENT) } else { rgba(0x2328331f) })
                         .child(
                             div()
                                 .absolute()
@@ -6590,10 +6730,46 @@ fn layers_panel(
                 .into_any_element(),
         );
     }
+    if wall_stats.0 > 0.05 {
+        let (all, bearing, horizontal, vertical) = wall_stats;
+        rows.push(
+            div()
+                .mt(px(5.0))
+                .pt(px(6.0))
+                .border_t_1()
+                .border_color(rgba(CHROME_BORDER))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(PANEL_TEXT))
+                        .child(SharedString::from(format!("墙体总长 {all:.1} m"))),
+                )
+                .child(div().text_size(px(8.5)).text_color(rgb(PANEL_MUTED)).child(
+                    SharedString::from(format!(
+                        "承重 {bearing:.1} · 非承重 {:.1}",
+                        (all - bearing).max(0.0)
+                    )),
+                ))
+                .child(div().text_size(px(8.5)).text_color(rgb(PANEL_MUTED)).child(
+                    SharedString::from(format!("横向(X) {horizontal:.1} · 纵向(Y) {vertical:.1}")),
+                ))
+                .into_any_element(),
+        );
+    }
     let close = weak;
+    // Keep the popover glued to the "图层" rail button instead of the window
+    // bottom: resizing the window taller used to drag it far below the button.
+    // On short windows it slides up, but never off the top of the canvas.
+    let extra_rows = usize::from(measure_count > 0) + usize::from(furniture_count > 0);
+    let stats_h = if wall_stats.0 > 0.05 { 48.0 } else { 0.0 };
+    let panel_h = 12.0 + 28.0 + 7.0 * 27.0 + extra_rows as f32 * 27.0 + stats_h + 2.0;
+    let top = 455.0_f32.min((viewport_h - 104.0 - panel_h).max(62.0));
     div()
         .absolute()
-        .bottom(px(104.0))
+        .top(px(top))
         .left(px(72.0))
         .w(px(194.0))
         .rounded(px(14.0))
@@ -7170,7 +7346,7 @@ fn import_modal(
                 .overflow_hidden()
                 .border_1()
                 .border_color(rgba(0x23283316))
-                .bg(rgba(0xffffff))
+                .bg(rgb(0xffffff))
                 .child(
                     img(path.clone())
                         .w_full()
@@ -7470,13 +7646,13 @@ fn materials_modal(
                 .bg(if active {
                     rgba(ACCENT_SOFT)
                 } else {
-                    rgba(0xf7f6f3)
+                    rgb(0xf7f6f3)
                 })
                 .flex()
                 .items_center()
                 .gap(px(8.0))
                 .cursor_pointer()
-                .hover(|style| style.bg(rgba(0xffffff)))
+                .hover(|style| style.bg(rgb(0xffffff)))
                 .child(
                     div()
                         .w(px(24.0))
@@ -7600,7 +7776,7 @@ fn materials_modal(
                     .h(px(30.0))
                     .px(px(7.0))
                     .rounded(px(6.0))
-                    .bg(rgba(0xffffff))
+                    .bg(rgb(0xffffff))
                     .border_1()
                     .border_color(rgba(0x23283316))
                     .child(inputs[index].clone()),
@@ -7714,12 +7890,12 @@ fn materials_modal(
                             .h(px(30.0))
                             .px_4()
                             .rounded(px(6.0))
-                            .bg(rgba(ACCENT))
+                            .bg(rgb(ACCENT))
                             .flex()
                             .items_center()
                             .text_size(px(10.0))
                             .text_color(rgb(0xffffff))
-                            .hover(|style| style.bg(rgba(0x2e61d4)))
+                            .hover(|style| style.bg(rgb(0x191e27)))
                             .child(t.s("保存修改", "Save"))
                             .on_mouse_down(MouseButton::Left, move |_ev, _window, cx| {
                                 if let Some(entity) = save_weak.upgrade() {
@@ -7803,7 +7979,7 @@ fn materials_modal(
                                         .items_center()
                                         .text_size(px(10.0))
                                         .text_color(rgb(ACCENT))
-                                        .hover(|style| style.bg(rgba(0xdbe6ff)))
+                                        .hover(|style| style.bg(rgba(0x2328331f)))
                                         .child(t.s("新增材料", "New material"))
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -7904,7 +8080,7 @@ fn floor_modal(
         let bg = if active {
             rgba(0x23283312)
         } else {
-            rgba(0xf7f6f3)
+            rgb(0xf7f6f3)
         };
         list = list.child(
             div()
@@ -7922,7 +8098,7 @@ fn floor_modal(
                 .items_center()
                 .justify_between()
                 .cursor_pointer()
-                .hover(|style| style.bg(rgba(0xffffff)))
+                .hover(|style| style.bg(rgb(0xffffff)))
                 .child(
                     div()
                         .flex()
@@ -8053,7 +8229,7 @@ fn floor_modal(
                                         .flex()
                                         .items_center()
                                         .rounded(px(7.0))
-                                        .bg(rgba(0xffffff))
+                                        .bg(rgb(0xffffff))
                                         .border_1()
                                         .border_color(rgba(CHROME_BORDER))
                                         .child(inputs[0].clone()),
@@ -8066,7 +8242,7 @@ fn floor_modal(
                                         .flex()
                                         .items_center()
                                         .rounded(px(7.0))
-                                        .bg(rgba(0xffffff))
+                                        .bg(rgb(0xffffff))
                                         .border_1()
                                         .border_color(rgba(CHROME_BORDER))
                                         .child(inputs[1].clone()),
@@ -8099,7 +8275,7 @@ fn floor_modal(
                                 .justify_center()
                                 .gap(px(5.0))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgba(0xffffff)))
+                                .hover(|style| style.bg(rgb(0xffffff)))
                                 .child(ui_icon(ICON_PLUS, 11.0, ACCENT))
                                 .child(
                                     div()
@@ -8129,7 +8305,7 @@ fn floor_modal(
                                 .justify_center()
                                 .gap(px(5.0))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(rgba(0xffffff)))
+                                .hover(|style| style.bg(rgb(0xffffff)))
                                 .child(ui_icon(ICON_PLUS, 11.0, ACCENT))
                                 .child(
                                     div()
@@ -9126,6 +9302,14 @@ fn install_transparent_titlebar(_window: &Window) {}
 static MAIN_NSWINDOW: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
+/// The live editor document, published for the AppKit quit delegate. The
+/// delegate runs on the main thread, the same thread that owns this mutex.
+static APP_STATE: OnceLock<Arc<Mutex<SceneState>>> = OnceLock::new();
+
+/// Set when the app itself initiated quit (update install) so the delegate
+/// does not show a save prompt.
+static ALLOW_TERMINATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(target_os = "macos")]
 fn install_window_presence_hooks(window: &mut Window, cx: &mut App) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -9146,7 +9330,7 @@ fn install_window_presence_hooks(window: &mut Window, cx: &mut App) {
             return;
         }
         MAIN_NSWINDOW.store(nswindow.cast(), std::sync::atomic::Ordering::Release);
-        install_reopen_handler();
+        install_app_delegate_hooks();
     }
     window.on_window_should_close(cx, |_window, _cx| {
         // Returning false cancels the close, so the plan, undo history and the
@@ -9157,7 +9341,7 @@ fn install_window_presence_hooks(window: &mut Window, cx: &mut App) {
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn install_reopen_handler() {
+unsafe fn install_app_delegate_hooks() {
     use objc2::runtime::AnyObject;
 
     unsafe {
@@ -9184,6 +9368,18 @@ unsafe fn install_reopen_handler() {
         if !added.as_bool() {
             eprintln!("Fathom: platform already owns the reopen handler");
         }
+
+        // Intercept ⌘Q / Dock quit so an edited but untitled plan can be named
+        // and saved instead of being lost. NSUInteger return, Bool-like reply.
+        let selector = objc2::sel!(applicationShouldTerminate:);
+        let implementation = std::mem::transmute::<
+            extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject) -> usize,
+            objc2::runtime::Imp,
+        >(fathom_should_terminate);
+        let added = objc2::ffi::class_addMethod(class, selector, implementation, c"Q@:@".as_ptr());
+        if !added.as_bool() {
+            eprintln!("Fathom: platform already owns the terminate handler");
+        }
     }
 }
 
@@ -9197,6 +9393,170 @@ extern "C" fn fathom_should_handle_reopen(
 ) -> objc2::runtime::Bool {
     show_main_window();
     objc2::runtime::Bool::YES
+}
+
+/// Callback for `-[NSApplicationDelegate applicationShouldTerminate:]`.
+/// Returns NSTerminateNow (1) or NSTerminateCancel (0). The user can save the
+/// plan here; an untitled document gets a save panel so the chosen file name
+/// becomes the plan name.
+#[cfg(target_os = "macos")]
+extern "C" fn fathom_should_terminate(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut objc2::runtime::AnyObject,
+) -> usize {
+    use std::sync::atomic::Ordering;
+
+    if ALLOW_TERMINATE.load(Ordering::Acquire) {
+        return 1;
+    }
+    let Some(state) = APP_STATE.get() else {
+        return 1;
+    };
+    let (dirty, untitled, name, lang) = {
+        let state = state.lock().unwrap();
+        (
+            state.is_dirty(),
+            state.is_untitled(),
+            state.doc.meta.name.trim().to_owned(),
+            state.lang,
+        )
+    };
+    if !dirty {
+        return 1;
+    }
+
+    let en = matches!(lang, i18n::Lang::En);
+    let label = if name.is_empty() {
+        if en { "Untitled" } else { "未命名方案" }.to_string()
+    } else {
+        name.clone()
+    };
+    let message = if en {
+        "Save changes?"
+    } else {
+        "保存更改？"
+    };
+    let info = if en {
+        format!("“{label}” has unsaved changes. Save before quitting?")
+    } else {
+        format!("“{label}”有未保存的更改，退出前要保存吗？")
+    };
+    let buttons = if en {
+        ["Save", "Don't Save", "Cancel"]
+    } else {
+        ["保存", "不保存", "取消"]
+    };
+    let response = unsafe { quit_alert(message, &info, buttons) };
+    match response {
+        1000 => {
+            let saved = if untitled {
+                let default_name = if name.is_empty() {
+                    if en {
+                        "Untitled.json".to_string()
+                    } else {
+                        "未命名方案.json".to_string()
+                    }
+                } else {
+                    format!("{}.json", name.replace(['/', '\\', ':'], "-"))
+                };
+                unsafe { save_with_panel(&default_name) }
+            } else {
+                let mut state = state.lock().unwrap();
+                state.save_now();
+                !state.is_dirty()
+            };
+            if saved {
+                1
+            } else {
+                if let Some(msg) = state.lock().unwrap().note.clone() {
+                    unsafe { error_alert(&msg) };
+                }
+                0
+            }
+        }
+        1001 => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn ns_string(value: &str) -> *mut objc2::runtime::AnyObject {
+    use std::ffi::CString;
+
+    let text = CString::new(value).unwrap_or_else(|_| CString::new("").unwrap());
+    unsafe {
+        objc2::msg_send![
+            objc2::class!(NSString),
+            stringWithUTF8String: text.as_ptr()
+        ]
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn quit_alert(message: &str, info: &str, buttons: [&str; 3]) -> isize {
+    use objc2::runtime::AnyObject;
+
+    unsafe {
+        let alert: *mut AnyObject = objc2::msg_send![objc2::class!(NSAlert), new];
+        let _: () = objc2::msg_send![alert, setMessageText: ns_string(message)];
+        let _: () = objc2::msg_send![alert, setInformativeText: ns_string(info)];
+        for title in buttons {
+            let _: *mut AnyObject = objc2::msg_send![alert, addButtonWithTitle: ns_string(title)];
+        }
+        let response: isize = objc2::msg_send![alert, runModal];
+        let _: () = objc2::msg_send![alert, release];
+        response
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn error_alert(message: &str) {
+    use objc2::runtime::AnyObject;
+
+    unsafe {
+        let alert: *mut AnyObject = objc2::msg_send![objc2::class!(NSAlert), new];
+        let _: () = objc2::msg_send![alert, setMessageText: ns_string(message)];
+        let _: () = objc2::msg_send![alert, setAlertStyle: 2usize];
+        let _: *mut AnyObject = objc2::msg_send![alert, addButtonWithTitle: ns_string("好")];
+        let _: isize = objc2::msg_send![alert, runModal];
+        let _: () = objc2::msg_send![alert, release];
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn save_with_panel(default_name: &str) -> bool {
+    use objc2::runtime::AnyObject;
+
+    unsafe {
+        let panel: *mut AnyObject = objc2::msg_send![objc2::class!(NSSavePanel), savePanel];
+        let _: () = objc2::msg_send![panel, setNameFieldStringValue: ns_string(default_name)];
+        let _: () = objc2::msg_send![panel, setCanCreateDirectories: true];
+        let ext = ns_string("json");
+        let types: *mut AnyObject = objc2::msg_send![objc2::class!(NSArray), arrayWithObject: ext];
+        let _: () = objc2::msg_send![panel, setAllowedFileTypes: types];
+        let response: isize = objc2::msg_send![panel, runModal];
+        if response != 1 {
+            return false;
+        }
+        let url: *mut AnyObject = objc2::msg_send![panel, URL];
+        let path: *mut AnyObject = objc2::msg_send![url, path];
+        let utf8: *const std::ffi::c_char = objc2::msg_send![path, UTF8String];
+        if utf8.is_null() {
+            return false;
+        }
+        let path = PathBuf::from(
+            std::ffi::CStr::from_ptr(utf8)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let Some(state) = APP_STATE.get() else {
+            return false;
+        };
+        let mut state = state.lock().unwrap();
+        state.save_as(path);
+        !state.is_dirty()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -9288,9 +9648,9 @@ fn main() {
                 let surface = window
                     .create_wgpu_surface(VIEW_W, VIEW_H, wgpu::TextureFormat::Rgba8UnormSrgb)
                     .expect("WGPUI WGPU surface unavailable");
-                let first_run = !scene::user_plan_path().is_file()
-                    || std::env::var("FP_NEW_MENU_SMOKE").is_ok();
+                let start_with_new_menu = std::env::var("FP_NEW_MENU_SMOKE").is_ok();
                 let state = Arc::new(Mutex::new(SceneState::new([VIEW_W as f32, VIEW_H as f32])));
+                APP_STATE.set(state.clone()).ok();
                 let surface_for_thread = surface.clone();
                 let state_for_thread = state.clone();
                 let (fps_tx, fps_rx) = mpsc::channel();
@@ -9430,7 +9790,7 @@ fn main() {
                         drag_pos: None,
                         sun_drag: false,
                         library_scroll: 0,
-                        new_menu_open: first_run,
+                        new_menu_open: start_with_new_menu,
                         recent_plans: recent::load(),
                         window_title: "Fathom 方寸".into(),
                         update_open: false,

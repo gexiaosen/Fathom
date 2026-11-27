@@ -5570,7 +5570,8 @@ pub fn plan_svg(state: &SceneState) -> String {
 
     // walls
     let _ = writeln!(out, "<g id=\"walls\">");
-    for wall in &doc.walls {
+    let svg_walls = SceneState::split_walls_at_openings(&doc.walls, &doc.openings);
+    for wall in &svg_walls {
         let _ = writeln!(
             out,
             "  <polygon points=\"{}\" fill=\"{}\"/>",
@@ -5755,7 +5756,7 @@ mod tests {
     use super::*;
     use crate::scene::SceneState;
     use fp_core::{EntityId, Pt};
-    use fp_model::{Document, Room, Wall, WallFinish, WallKind};
+    use fp_model::{Document, Opening, OpeningKind, Room, Wall, WallFinish, WallKind};
     use std::path::PathBuf;
 
     #[test]
@@ -5783,6 +5784,33 @@ mod tests {
             peak > eave_h + 0.2,
             "roof profile peak {peak} above eave {eave_h}"
         );
+    }
+
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored"]
+    fn export_door_gap_probe() {
+        let mut doc = Document::new("door-probe");
+        doc.walls.push(Wall::new(
+            EntityId(1),
+            Pt::new(0, 0),
+            Pt::new(4000, 0),
+            200,
+            WallKind::Partition,
+        ));
+        doc.openings.push(Opening {
+            id: EntityId(2),
+            wall_id: EntityId(1),
+            kind: OpeningKind::Door,
+            offset_mm: 500,
+            width_mm: 900,
+            height_mm: 2100,
+            sill_mm: 0,
+            swing_deg: 90.0,
+            hinge_right: false,
+            price: None,
+        });
+        let state = SceneState::from_doc(doc, [900.0, 700.0], PathBuf::from("/tmp/door.json"));
+        export_png(&state, Path::new("/tmp/fp-door-probe.png")).expect("door probe");
     }
 
     #[test]
@@ -5966,6 +5994,29 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"%PDF-1.4"), "pdf header");
         assert!(bytes.len() > 100_000, "pdf too small: {}", bytes.len());
+    }
+
+    #[test]
+    #[ignore = "needs a GPU; writes preview files"]
+    fn export_cutaway_probe() {
+        let json = include_str!("../../../assets/samples/demo-apartment.json");
+        let doc = Document::from_json(json).expect("demo json");
+        let mut state = SceneState::from_doc(doc, [1280.0, 720.0], PathBuf::from("/tmp/cut.json"));
+        state.sun = 0.55;
+        state.cutaway = true;
+        state.preset3d(crate::scene::Preset3d::Oblique);
+        let mesh = state.mesh3d();
+        let vp = state.cam3.view_proj(1920.0 / 1200.0);
+        render_3d_frame(
+            &mesh,
+            Path::new("/tmp/fp-cutaway-probe.png"),
+            1920,
+            1200,
+            vp,
+            state.cam3.eye().to_array(),
+            state.look3d(),
+        )
+        .expect("cutaway probe");
     }
 
     #[test]
