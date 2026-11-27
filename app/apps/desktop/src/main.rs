@@ -2733,8 +2733,15 @@ impl Render for PlanEditor {
 /// Light frosted side panels: the user asked for no black backing around the
 /// floating editors, so the inspector/library/layers share this warm white tint
 /// instead of the old near-opaque navy glass.
-const SUN_SLIDER_LEFT: f32 = 106.0;
-const SUN_SLIDER_WIDTH: f32 = 174.0;
+/// 3D panel geometry. The sun slider reads pointer coordinates in window
+/// space, so its hit area must follow the panel's real left edge and inner
+/// width; the old hard-coded 106/174 origin made the knob jump away from the
+/// cursor as soon as the panel moved to the left edge.
+const VIEW3D_PANEL_LEFT: f32 = 14.0;
+const VIEW3D_PANEL_WIDTH: f32 = 220.0;
+const VIEW3D_PANEL_PAD: f32 = 8.0;
+const SUN_SLIDER_LEFT: f32 = VIEW3D_PANEL_LEFT + VIEW3D_PANEL_PAD;
+const SUN_SLIDER_WIDTH: f32 = VIEW3D_PANEL_WIDTH - VIEW3D_PANEL_PAD * 2.0;
 const PANEL_BG: u32 = 0xfdfcf9eb;
 const PANEL_BORDER: u32 = 0x23283322;
 const PANEL_TEXT: u32 = 0x252b36;
@@ -6411,14 +6418,14 @@ fn view3d_panel(
     let sun_move_weak = sun_weak.clone();
     let sun_bar = div()
         .h(px(10.0))
-        .w_full()
+        .w(px(SUN_SLIDER_WIDTH))
         .rounded_full()
         .bg(rgba(0x1d223012))
         .relative()
         .child(
             div()
                 .h_full()
-                .w(px(174.0 * sun_pct))
+                .w(px(SUN_SLIDER_WIDTH * sun_pct))
                 .rounded_full()
                 .bg(rgb(ACCENT)),
         )
@@ -6426,7 +6433,7 @@ fn view3d_panel(
             div()
                 .absolute()
                 .top(px(-3.0))
-                .left(px((174.0 * sun_pct - 3.0).max(0.0)))
+                .left(px((SUN_SLIDER_WIDTH * sun_pct - 3.0).max(0.0)))
                 .w(px(6.0))
                 .h(px(16.0))
                 .rounded_full()
@@ -6494,15 +6501,15 @@ fn view3d_panel(
     div()
         .absolute()
         .top(px(62.0))
-        .left(px(14.0))
-        .w(px(220.0))
+        .left(px(VIEW3D_PANEL_LEFT))
+        .w(px(VIEW3D_PANEL_WIDTH))
         .rounded(px(14.0))
         .bg(rgba(PANEL_BG))
         .shadow_sm()
         .border_1()
         .border_color(rgba(PANEL_BORDER))
         .text_color(rgb(PANEL_TEXT))
-        .p_2()
+        .p(px(VIEW3D_PANEL_PAD))
         .flex()
         .flex_col()
         .gap_1()
