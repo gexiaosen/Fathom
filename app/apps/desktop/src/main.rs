@@ -2742,6 +2742,11 @@ const VIEW3D_PANEL_WIDTH: f32 = 220.0;
 const VIEW3D_PANEL_PAD: f32 = 8.0;
 const SUN_SLIDER_LEFT: f32 = VIEW3D_PANEL_LEFT + VIEW3D_PANEL_PAD;
 const SUN_SLIDER_WIDTH: f32 = VIEW3D_PANEL_WIDTH - VIEW3D_PANEL_PAD * 2.0;
+
+/// Map a window-space x coordinate to the sun slider's 0..1 value.
+fn sun_slider_value(x: f32) -> f32 {
+    ((x - SUN_SLIDER_LEFT) / SUN_SLIDER_WIDTH).clamp(0.0, 1.0)
+}
 const PANEL_BG: u32 = 0xfdfcf9eb;
 const PANEL_BORDER: u32 = 0x23283322;
 const PANEL_TEXT: u32 = 0x252b36;
@@ -6440,8 +6445,7 @@ fn view3d_panel(
                 .bg(rgb(0x3a4150)),
         )
         .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
-            let value =
-                ((f32::from(ev.position.x) - SUN_SLIDER_LEFT) / SUN_SLIDER_WIDTH).clamp(0.0, 1.0);
+            let value = sun_slider_value(f32::from(ev.position.x));
             if let Some(entity) = sun_down_weak.upgrade() {
                 entity.update(cx, |this, cx| {
                     this.sun_drag = true;
@@ -6454,8 +6458,7 @@ fn view3d_panel(
         // events. Track the move here so the knob follows the pointer instead
         // of stopping at the initial click.
         .on_mouse_move(move |ev, _window, cx| {
-            let value =
-                ((f32::from(ev.position.x) - SUN_SLIDER_LEFT) / SUN_SLIDER_WIDTH).clamp(0.0, 1.0);
+            let value = sun_slider_value(f32::from(ev.position.x));
             if let Some(entity) = sun_move_weak.upgrade() {
                 entity.update(cx, |this, cx| {
                     if this.sun_drag {
@@ -9627,6 +9630,26 @@ fn begin_window_drag(window: &Window) {
         if !event.is_null() {
             let _: () = objc2::msg_send![nswindow, performWindowDragWithEvent: event];
         }
+    }
+}
+
+#[cfg(test)]
+mod slider_tests {
+    use super::*;
+
+    #[test]
+    fn sun_slider_tracks_the_panel_edges() {
+        assert_eq!(sun_slider_value(SUN_SLIDER_LEFT), 0.0);
+        assert_eq!(
+            sun_slider_value(SUN_SLIDER_LEFT + SUN_SLIDER_WIDTH * 0.5),
+            0.5
+        );
+        assert_eq!(sun_slider_value(SUN_SLIDER_LEFT + SUN_SLIDER_WIDTH), 1.0);
+        assert_eq!(sun_slider_value(SUN_SLIDER_LEFT - 50.0), 0.0);
+        assert_eq!(
+            sun_slider_value(SUN_SLIDER_LEFT + SUN_SLIDER_WIDTH + 50.0),
+            1.0
+        );
     }
 }
 
